@@ -1,0 +1,58 @@
+import os
+import matplotlib
+# 【防爆核心】强制使用无头渲染模式，完美绕过笔记本的所有显示器/X11报错
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+
+from nuscenes.nuscenes import NuScenes
+from nuscenes.eval.detection.evaluate import NuScenesEval
+from nuscenes.eval.detection.config import config_factory
+from nuscenes.eval.detection.render import visualize_sample
+
+def main():
+    print("正在加载 nuScenes mini 数据集...")
+    # 1. 初始化原生数据集
+    nusc = NuScenes(version='v1.0-mini', dataroot='data/nuscenes', verbose=False)
+    
+    # 2. 设定路径
+    res_path = './work_dirs/baseline_ow/my_results/pred_instances_3d/results_nusc.json'
+    output_dir = './work_dirs/baseline_ow/custom_vis'
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("正在解析你的预测 JSON 结果...")
+    # 3. 利用官方评估器快速读取和配对 GT 与 Pred
+    cfg = config_factory('detection_cvpr_2019')
+    nusc_eval = NuScenesEval(
+        nusc, 
+        config=cfg, 
+        result_path=res_path, 
+        eval_set='mini_val', 
+        output_dir=output_dir, 
+        verbose=False
+    )
+
+    # 提取对齐后的真实框(GT)和预测框(Pred)
+    gt_boxes = nusc_eval.gt_boxes
+    pred_boxes = nusc_eval.pred_boxes
+
+    # 4. 遍历验证集中的前 5 个场景进行可视化
+    sample_tokens = nusc_eval.sample_tokens[:5]
+    
+    for token in sample_tokens:
+        print(f"正在渲染 BEV 鸟瞰图: {token}")
+        save_path = os.path.join(output_dir, f"{token}_bev.png")
+        
+        # 调用官方神级渲染函数：将 GT 和 Pred 画在同一个 BEV 坐标系下
+        visualize_sample(
+            nusc, 
+            token, 
+            gt_boxes, 
+            pred_boxes, 
+            eval_range=40, # 渲染自车周围 40 米的范围
+            savepath=save_path
+        )
+    
+    print(f"\n大功告成！所有图片已安全保存至: {output_dir}")
+
+if __name__ == '__main__':
+    main()

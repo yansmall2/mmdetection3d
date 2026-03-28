@@ -139,10 +139,10 @@ def main():
             '3d visualzier',
             data_input,
             data_sample=data_sample,
-            show=not args.not_show,
-            wait_time=args.show_interval,
+            show=False,
+            wait_time=0,
             out_file=out_file,
-            o3d_save_path=o3d_save_path,
+            o3d_save_path=None,
             vis_task=vis_task)
 
         progress_bar.update()

@@ -1,0 +1,32 @@
+import pickle
+import copy
+
+def filter_dbinfos(db_path, out_path, unseen_classes):
+    with open(db_path, 'rb') as f:
+        db_infos = pickle.load(f)
+    
+    ow_db_infos = copy.deepcopy(db_infos)
+    removed_counts = {}
+    
+    # 遍历黑名单，直接从数据库“户口本”中注销它们
+    for cls in unseen_classes:
+        if cls in ow_db_infos:
+            removed_counts[cls] = len(ow_db_infos[cls])
+            del ow_db_infos[cls]  # 物理删除该键值对
+        else:
+            removed_counts[cls] = 0
+
+    with open(out_path, 'wb') as f:
+        pickle.dump(ow_db_infos, f)
+    
+    print(f"✅ 数据库 (dbinfos) 清洗完成！")
+    for cls, count in removed_counts.items():
+        print(f"   - 从库中物理移除了 {count} 个 {cls} 增强样本")
+    print(f"📁 输出文件: {out_path}")
+
+if __name__ == '__main__':
+    filter_dbinfos(
+        db_path='data/nuscenes/nuscenes_dbinfos_train.pkl',
+        out_path='data/nuscenes/nuscenes_dbinfos_train_ow.pkl',
+        unseen_classes=['construction_vehicle']
+    )

@@ -111,7 +111,7 @@ train_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file='nuscenes_infos_train.pkl',
+        ann_file='nuscenes_infos_train_ow.pkl',
         pipeline=train_pipeline,
         metainfo=metainfo,
         modality=input_modality,
@@ -161,6 +161,8 @@ val_evaluator = dict(
     data_root=data_root,
     ann_file=data_root + 'nuscenes_infos_val.pkl',
     metric='bbox',
+    format_only=True,  # 👈 【核心修改】告诉框架：只保存JSON，别管评分！
+    jsonfile_prefix='./work_dirs/baseline_ow/my_results' ,
     backend_args=backend_args)
 test_evaluator = val_evaluator
 

@@ -1,0 +1,141 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.data_classes import LidarPointCloud
+from pyquaternion import Quaternion
+
+# ======================
+# 1. 路径
+# ======================
+DATAROOT = 'data/nuscenes'
+VERSION = 'v1.0-mini'
+
+nusc = NuScenes(version=VERSION, dataroot=DATAROOT, verbose=False)
+
+# ======================
+# 2. 第一帧
+# ======================
+sample = nusc.get('sample', '3e8750f331d7499e9b5123e9eb70f2e2')
+
+lidar_token = sample['data']['LIDAR_TOP']
+lidar_data = nusc.get('sample_data', lidar_token)
+
+lidar_path = os.path.join(DATAROOT, lidar_data['filename'])
+
+# ======================
+# 3. 点云
+# ======================
+pc = LidarPointCloud.from_file(lidar_path)
+points = pc.points[:3, :].T
+
+# ======================
+# 4. 坐标变换
+# ======================
+cs_record = nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+pose_record = nusc.get('ego_pose', lidar_data['ego_pose_token'])
+
+# ======================
+# 5. 类别颜色
+# ======================
+COLOR_MAP = {
+    'vehicle': 'red',
+    'pedestrian': 'blue',
+    'bicycle': 'green',
+    'motorcycle': 'purple',
+    'bus': 'orange',
+    'truck': 'brown',
+    'trailer': 'pink',
+    'vehicle.construction': 'gray',
+    'barrier': 'black',
+    'traffic_cone': 'yellow'
+}
+
+def get_color(category_name):
+    for key in COLOR_MAP:
+        if key in category_name:
+            return COLOR_MAP[key]
+    return 'cyan'
+
+# ======================
+# 6. 画点云
+# ======================
+plt.figure(figsize=(10, 10))
+plt.scatter(points[:, 0], points[:, 1], s=0.3, alpha=0.3)
+
+# ======================
+# 7. 画 GT 框
+# ======================
+for ann_token in sample['anns']:
+    ann = nusc.get('sample_annotation', ann_token)
+    category = ann['category_name']
+
+    box = nusc.get_box(ann_token)
+
+    # global → ego
+    box.translate(-np.array(pose_record['translation']))
+    box.rotate(Quaternion(pose_record['rotation']).inverse)
+
+    # ego → lidar
+    box.translate(-np.array(cs_record['translation']))
+    box.rotate(Quaternion(cs_record['rotation']).inverse)
+
+    corners = box.bottom_corners()[:2, :]
+    corners = np.concatenate([corners, corners[:, :1]], axis=1)
+
+    color = get_color(category)
+    plt.plot(corners[0, :], corners[1, :], color=color, linewidth=2)
+
+# ======================
+# 8. ⭐ 画自车（关键！！！）
+# ======================
+ego_x, ego_y = 0, 0
+
+# 自车位置（黑色圆点）
+plt.scatter(ego_x, ego_y, c='black', s=100, label='ego vehicle')
+
+# 自车朝向箭头（x轴正方向 = 前）
+plt.arrow(ego_x, ego_y, 5, 0, 
+          head_width=1.5, head_length=2, 
+          fc='black', ec='black')
+
+# ======================
+# 9. 坐标轴方向提示（非常关键）
+# ======================
+plt.text(5, 0, 'Front →', fontsize=12, color='black')
+plt.text(0, 5, 'Left ↑', fontsize=12, color='black')
+
+# ======================
+# 10. 视野范围（推荐前视）
+# ======================
+plt.xlim(-20, 50)
+plt.ylim(-30, 30)
+
+plt.title("nuScenes BEV (with Ego Vehicle)")
+plt.xlabel("X (Front)")
+plt.ylabel("Y (Left)")
+plt.axis('equal')
+
+# ======================
+# 11. 图例
+# ======================
+import matplotlib.patches as mpatches
+
+legend_patches = [mpatches.Patch(color=v, label=k) for k, v in COLOR_MAP.items()]
+legend_patches.append(mpatches.Patch(color='black', label='ego'))
+
+plt.legend(handles=legend_patches, loc='upper right')
+
+# ======================
+# 12. 保存
+# ======================
+plt.savefig("nuscenes_with_ego.png", dpi=300)
+plt.show()
+# 获取前视相机
+cam_token = sample['data']['CAM_FRONT_RIGHT']
+cam_data = nusc.get('sample_data', cam_token)
+
+# 图片路径
+img_path = os.path.join(DATAROOT, cam_data['filename'])
+
+print("对应的前视图像路径：", img_path)

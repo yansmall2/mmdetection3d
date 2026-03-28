@@ -1,0 +1,51 @@
+import pickle
+import copy
+
+def generate_open_world_pkl(input_path, output_path, unseen_classes):
+    with open(input_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    ow_data = copy.deepcopy(data)
+    total_removed = 0
+
+    # 1. 修复点：使用正确的键名 'categories'
+    categories = ow_data['metainfo']['categories']
+    
+    # 2. 翻转字典：把 {'car': 0, 'truck': 1} 变成 {0: 'car', 1: 'truck'}，方便通过 ID 查名字
+    id_to_name = {v: k for k, v in categories.items()}
+    
+    samples = ow_data.get('data_list', ow_data.get('infos', []))
+
+    for sample in samples:
+        if 'instances' not in sample:
+            continue
+
+        instances = sample['instances']
+        keep_instances = []
+
+        for inst in instances:
+            label = inst['bbox_label_3d']
+            
+            # 使用 .get() 方法更安全。如果是 -1 这种忽略类，会默认返回 'unknown'，不会报错
+            name = id_to_name.get(label, 'unknown')
+
+            if name not in unseen_classes:
+                keep_instances.append(inst)
+            else:
+                total_removed += 1
+        
+        sample['instances'] = keep_instances
+
+    with open(output_path, 'wb') as f:
+        pickle.dump(ow_data, f)
+    
+    print(f"✅ 删除实例数: {total_removed}")
+    print(f"📁 输出文件: {output_path}")
+
+if __name__ == '__main__':
+    generate_open_world_pkl(
+        input_path='data/nuscenes/nuscenes_infos_train.pkl', 
+        output_path='data/nuscenes/nuscenes_infos_train_ow.pkl', 
+        # 严谨屏蔽这两种类别
+        unseen_classes=['construction_vehicle'] 
+    )
