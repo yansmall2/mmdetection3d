@@ -89,7 +89,9 @@ class NuScenesDataset(Det3DDataset):
                  test_mode: bool = False,
                  with_velocity: bool = True,
                  use_valid_flag: bool = False,
+                 holdout_classes: List[str] = None,
                  **kwargs) -> None:
+        self.holdout_classes = holdout_classes if holdout_classes is not None else []
         self.use_valid_flag = use_valid_flag
         self.with_velocity = with_velocity
 
@@ -145,6 +147,19 @@ class NuScenesDataset(Det3DDataset):
         """
         ann_info = super().parse_ann_info(info)
         if ann_info is not None:
+            if getattr(self, 'holdout_classes', []) and not self.test_mode:
+                holdout_indices = [self.METAINFO['classes'].index(c) for c in self.holdout_classes if c in self.METAINFO['classes']]
+                gt_labels = ann_info['gt_labels_3d']
+                keep_mask = np.ones(len(gt_labels), dtype=bool)
+                for cls_idx in holdout_indices:
+                    keep_mask &= (gt_labels != cls_idx)
+                for key in ann_info.keys():
+                    if key == 'instances':
+                        ann_info['instances'] = [inst for inst, keep in zip(ann_info['instances'], keep_mask) if keep]
+                    elif isinstance(ann_info[key], np.ndarray):
+                        ann_info[key] = ann_info[key][keep_mask]
+                    elif isinstance(ann_info[key], list):
+                        ann_info[key] = [item for m, item in zip(keep_mask, ann_info[key]) if m]
 
             ann_info = self._filter_with_mask(ann_info)
 

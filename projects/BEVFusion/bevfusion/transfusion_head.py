@@ -42,6 +42,58 @@ class ConvFuser(nn.Sequential):
         return super().forward(torch.cat(inputs, dim=1))
 
 
+class SpatialCrossAttention(nn.Module):
+    def __init__(self, in_channels_q, in_channels_k, hidden_channels=None):
+        super(SpatialCrossAttention, self).__init__()
+        if hidden_channels is None:
+            hidden_channels = in_channels_q
+        
+        self.proj_q = nn.Conv2d(in_channels_q, hidden_channels, 1, bias=False)
+        self.proj_k = nn.Conv2d(in_channels_k, hidden_channels, 1, bias=False)
+        self.proj_v = nn.Conv2d(in_channels_k, hidden_channels, 1, bias=False)
+        
+        self.attn_scale = hidden_channels ** -0.5
+
+    def forward(self, x_q, x_k):
+        # Point-wise spatial cross attention
+        q = self.proj_q(x_q)
+        k = self.proj_k(x_k)
+        v = self.proj_v(x_k)
+        
+        # Spatial alignment weight map [B, 1, H, W]
+        attn = torch.sum(q * k, dim=1, keepdim=True) * self.attn_scale
+        attn = torch.sigmoid(attn)
+        return attn * v
+
+@MODELS.register_module()
+class CrossAttentionFuser(nn.Module):
+    def __init__(self, in_channels: List[int], out_channels: int) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        img_channels, pts_channels = in_channels[0], in_channels[1]
+        
+        # LiDAR point cloud queries Camera Multi-view representation
+        self.cross_attn = SpatialCrossAttention(pts_channels, img_channels, img_channels)
+        
+        self.fuser = nn.Sequential(
+            nn.Conv2d(img_channels + pts_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True),
+        )
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        img_feat, pts_feat = inputs[0], inputs[1]
+        
+        # Soft Alignment: LiDAR features acts as Query to adaptively highlight/query camera semantic regions
+        aligned_img_feat = self.cross_attn(x_q=pts_feat, x_k=img_feat)
+        
+        # Concatenate and fuse
+        fused = self.fuser(torch.cat([aligned_img_feat, pts_feat], dim=1))
+        
+        return fused
+
+
 @MODELS.register_module()
 class TransFusionHead(nn.Module):
 
@@ -127,6 +179,30 @@ class TransFusionHead(nn.Module):
                 bias=bias,
             ))
         self.heatmap_head = nn.Sequential(*layers)
+        
+        # [NEW] Objectness Head for decoupling
+        obj_layers = []
+        obj_layers.append(
+            ConvModule(
+                hidden_channel,
+                hidden_channel,
+                kernel_size=3,
+                padding=1,
+                bias=bias,
+                conv_cfg=dict(type='Conv2d'),
+                norm_cfg=dict(type='BN2d'),
+            ))
+        obj_layers.append(
+            build_conv_layer(
+                dict(type='Conv2d'),
+                hidden_channel,
+                1,  # 1 channel for objectness
+                kernel_size=3,
+                padding=1,
+                bias=bias,
+            ))
+        self.objectness_head = nn.Sequential(*obj_layers)
+        
         self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
 
         # transformer decoder layers for object query with LiDAR feature
@@ -139,6 +215,7 @@ class TransFusionHead(nn.Module):
         for i in range(self.num_decoder_layers):
             heads = copy.deepcopy(common_heads)
             heads.update(dict(heatmap=(self.num_classes, num_heatmap_convs)))
+            heads.update(dict(objectness=(1, num_heatmap_convs))) # [NEW]
             self.prediction_heads.append(
                 SeparateHead(
                     hidden_channel,
@@ -226,34 +303,33 @@ class TransFusionHead(nn.Module):
         #################################
         with torch.autocast('cuda', enabled=False):
             dense_heatmap = self.heatmap_head(fusion_feat.float())
+            dense_objectness = self.objectness_head(fusion_feat.float()) # [NEW]
+            
         heatmap = dense_heatmap.detach().sigmoid()
+        objectness = dense_objectness.detach().sigmoid() # [NEW]
+        
         padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
+        local_max = torch.zeros_like(objectness)
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
-            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
+            objectness, kernel_size=self.nms_kernel_size, stride=1, padding=0)
         local_max[:, :, padding:(-padding),
                   padding:(-padding)] = local_max_inner
-        # for Pedestrian & Traffic_cone in nuScenes
-        if self.test_cfg['dataset'] == 'nuScenes':
-            local_max[:, 8, ] = F.max_pool2d(
-                heatmap[:, 8], kernel_size=1, stride=1, padding=0)
-            local_max[:, 9, ] = F.max_pool2d(
-                heatmap[:, 9], kernel_size=1, stride=1, padding=0)
-        elif self.test_cfg[
-                'dataset'] == 'Waymo':  # for Pedestrian & Cyclist in Waymo
-            local_max[:, 1, ] = F.max_pool2d(
-                heatmap[:, 1], kernel_size=1, stride=1, padding=0)
-            local_max[:, 2, ] = F.max_pool2d(
-                heatmap[:, 2], kernel_size=1, stride=1, padding=0)
-        heatmap = heatmap * (heatmap == local_max)
-        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
+        
+        objectness = objectness * (objectness == local_max)
+        objectness = objectness.view(batch_size, 1, -1)
 
-        # top num_proposals among all classes
-        top_proposals = heatmap.view(batch_size, -1).argsort(
+        # top num_proposals based on objectness
+        top_proposals = objectness.view(batch_size, -1).argsort(
             dim=-1, descending=True)[..., :self.num_proposals]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
-        top_proposals_index = top_proposals % heatmap.shape[-1]
+        
+        top_proposals_index = top_proposals
+        
+        # Get implicit class from the semantic heatmap for class-encoding
+        flat_heatmap = heatmap.view(batch_size, self.num_classes, -1)
+        top_proposals_class = flat_heatmap.gather(
+            2, top_proposals_index[:, None, :].expand(-1, self.num_classes, -1)).argmax(dim=1)
+            
         query_feat = fusion_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
                 -1, fusion_feat_flatten.shape[1], -1),
@@ -295,13 +371,18 @@ class TransFusionHead(nn.Module):
             # for next level positional embedding
             query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
 
-        ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
+        ret_dicts[0]['query_heatmap_score'] = flat_heatmap.gather(
             index=top_proposals_index[:,
                                       None, :].expand(-1, self.num_classes,
                                                       -1),
             dim=-1,
         )  # [bs, num_classes, num_proposals]
+        ret_dicts[0]['query_objectness_score'] = objectness.gather(
+            index=top_proposals_index[:, None, :].expand(-1, 1, -1),
+            dim=-1,
+        ) # [bs, 1, num_proposals]
         ret_dicts[0]['dense_heatmap'] = dense_heatmap
+        ret_dicts[0]['dense_objectness'] = dense_objectness # [NEW]
 
         if self.auxiliary is False:
             # only return the results of last decoder layer
@@ -311,7 +392,8 @@ class TransFusionHead(nn.Module):
         new_res = {}
         for key in ret_dicts[0].keys():
             if key not in [
-                    'dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score'
+                    'dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score',
+                    'dense_objectness', 'query_objectness_score'
             ]:
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1)
@@ -359,13 +441,16 @@ class TransFusionHead(nn.Module):
             batch_size = preds_dict[0]['heatmap'].shape[0]
             batch_score = preds_dict[0]['heatmap'][
                 ..., -self.num_proposals:].sigmoid()
-            # if self.loss_iou.loss_weight != 0:
-            #    batch_score = torch.sqrt(batch_score * preds_dict[0]['iou'][..., -self.num_proposals:].sigmoid()) # noqa: E501
+            batch_obj = preds_dict[0]['objectness'][
+                ..., -self.num_proposals:].sigmoid() # [NEW]
+
             one_hot = F.one_hot(
                 self.query_labels,
                 num_classes=self.num_classes).permute(0, 2, 1)
             batch_score = batch_score * preds_dict[0][
                 'query_heatmap_score'] * one_hot
+            
+            batch_obj = batch_obj * preds_dict[0]['query_objectness_score'] # [NEW]
 
             batch_center = preds_dict[0]['center'][..., -self.num_proposals:]
             batch_height = preds_dict[0]['height'][..., -self.num_proposals:]
@@ -384,6 +469,24 @@ class TransFusionHead(nn.Module):
                 batch_vel,
                 filter=True,
             )
+
+            # [NEW] Open-World Reasoning Logic
+            obj_thresh = 0.5
+            cls_thresh = 0.3
+            unknown_label_id = self.num_classes # Representing 'Unknown' class
+            for i in range(batch_size):
+                obj_scores_i = batch_obj[i, 0] # shape: [num_proposals]
+                max_semantic_scores_i = batch_score[i].max(dim=0).values # shape: [num_proposals]
+                # Identify unknown objects
+                is_unknown = (obj_scores_i > obj_thresh) & (max_semantic_scores_i < cls_thresh)
+                
+                # We need to update labels and scores in temp[i]
+                # temp[i]['labels'] has shape [num_proposals]
+                temp[i]['labels'][is_unknown] = unknown_label_id
+                
+                # Update the score to be the objectness score for unknown objects
+                # so they are not filtered out by low semantic score
+                temp[i]['scores'][is_unknown] = obj_scores_i[is_unknown]
 
             if self.test_cfg['dataset'] == 'nuScenes':
                 self.tasks = [
@@ -405,6 +508,13 @@ class TransFusionHead(nn.Module):
                         indices=[9],
                         radius=0.175,
                     ),
+                    # [NEW] Task for Unknown Obstacles
+                    dict(
+                        num_class=1,
+                        class_names=['unknown'],
+                        indices=[unknown_label_id],
+                        radius=-1,
+                    ),
                 ]
             elif self.test_cfg['dataset'] == 'Waymo':
                 self.tasks = [
@@ -422,6 +532,12 @@ class TransFusionHead(nn.Module):
                         num_class=1,
                         class_names=['Cyclist'],
                         indices=[2],
+                        radius=0.7),
+                    # [NEW] Task for Unknown Obstacles
+                    dict(
+                        num_class=1,
+                        class_names=['Unknown'],
+                        indices=[unknown_label_id],
                         radius=0.7),
                 ]
 
@@ -550,6 +666,7 @@ class TransFusionHead(nn.Module):
         num_pos = np.sum(res_tuple[5])
         matched_ious = np.mean(res_tuple[6])
         heatmap = torch.cat(res_tuple[7], dim=0)
+        objectness_heatmap = torch.cat(res_tuple[8], dim=0) # [NEW]
         return (
             labels,
             label_weights,
@@ -559,6 +676,7 @@ class TransFusionHead(nn.Module):
             num_pos,
             matched_ious,
             heatmap,
+            objectness_heatmap,
         )
 
     def get_targets_single(self, gt_instances_3d, preds_dict, batch_idx):
@@ -702,6 +820,8 @@ class TransFusionHead(nn.Module):
                             )  # [x_len, y_len]
         heatmap = gt_bboxes_3d.new_zeros(self.num_classes, feature_map_size[1],
                                          feature_map_size[0])
+        objectness_heatmap = gt_bboxes_3d.new_zeros(1, feature_map_size[1],
+                                         feature_map_size[0]) # [NEW]
         for idx in range(len(gt_bboxes_3d)):
             width = gt_bboxes_3d[idx][3]
             length = gt_bboxes_3d[idx][4]
@@ -729,6 +849,8 @@ class TransFusionHead(nn.Module):
                 # NOTE: fix
                 draw_heatmap_gaussian(heatmap[gt_labels_3d[idx]],
                                       center_int[[1, 0]], radius)
+                draw_heatmap_gaussian(objectness_heatmap[0],
+                                      center_int[[1, 0]], radius) # [NEW]
 
         mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
         return (
@@ -740,6 +862,7 @@ class TransFusionHead(nn.Module):
             int(pos_inds.shape[0]),
             float(mean_iou),
             heatmap[None],
+            objectness_heatmap[None], # [NEW]
         )
 
     def loss(self, batch_feats, batch_data_samples):
@@ -774,6 +897,7 @@ class TransFusionHead(nn.Module):
             num_pos,
             matched_ious,
             heatmap,
+            objectness_heatmap, # [NEW]
         ) = self.get_targets(batch_gt_instances_3d, preds_dicts[0])
         if hasattr(self, 'on_the_image_mask'):
             label_weights = label_weights * self.on_the_image_mask
@@ -788,7 +912,13 @@ class TransFusionHead(nn.Module):
             heatmap.float(),
             avg_factor=max(heatmap.eq(1).float().sum().item(), 1),
         )
+        loss_objectness = self.loss_heatmap(
+            clip_sigmoid(preds_dict['dense_objectness']).float(),
+            objectness_heatmap.float(),
+            avg_factor=max(objectness_heatmap.eq(1).float().sum().item(), 1),
+        ) # [NEW]
         loss_dict['loss_heatmap'] = loss_heatmap
+        loss_dict['loss_objectness'] = loss_objectness # [NEW]
 
         # compute loss for each layer
         for idx_layer in range(

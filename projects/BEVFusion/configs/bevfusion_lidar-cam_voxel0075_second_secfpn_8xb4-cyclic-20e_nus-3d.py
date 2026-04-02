@@ -54,7 +54,7 @@ model = dict(
         dbound=[1.0, 60.0, 0.5],
         downsample=2),
     fusion_layer=dict(
-        type='ConvFuser', in_channels=[80, 256], out_channels=256))
+        type='CrossAttentionFuser', in_channels=[80, 256], out_channels=256))
 
 train_pipeline = [
     dict(
@@ -233,3 +233,9 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50),
     checkpoint=dict(type='CheckpointHook', interval=1))
 del _base_.custom_hooks
+
+# [NEW] Set find_unused_parameters for decoupled Objectness Head in Open-World inference
+model_wrapper_cfg = dict(
+    type='MMDistributedDataParallel',
+    find_unused_parameters=True
+)

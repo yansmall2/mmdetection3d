@@ -162,9 +162,9 @@ db_sampler = dict(
             truck=5,
             bus=5,
             trailer=5,
-            construction_vehicle=5,
+            # construction_vehicle=5, # [Holdout filtered]
             traffic_cone=5,
-            barrier=5,
+            # barrier=5,              # [Holdout filtered]
             motorcycle=5,
             bicycle=5,
             pedestrian=5)),
@@ -172,10 +172,10 @@ db_sampler = dict(
     sample_groups=dict(
         car=2,
         truck=3,
-        construction_vehicle=7,
+        # construction_vehicle=7,     # [Holdout filtered]
         bus=4,
         trailer=6,
-        barrier=2,
+        # barrier=2,                  # [Holdout filtered]
         motorcycle=6,
         bicycle=6,
         pedestrian=2,
@@ -267,7 +267,7 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=4,
+    batch_size=1,
     num_workers=4,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
