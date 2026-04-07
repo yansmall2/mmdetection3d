@@ -67,10 +67,15 @@ class SpatialCrossAttention(nn.Module):
 
 @MODELS.register_module()
 class CrossAttentionFuser(nn.Module):
-    def __init__(self, in_channels: List[int], out_channels: int) -> None:
+    def __init__(self,
+                 in_channels: List[int],
+                 out_channels: int,
+                 use_residual_img: bool = False,
+                 residual_alpha_init: float = 0.1) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.use_residual_img = use_residual_img
         img_channels, pts_channels = in_channels[0], in_channels[1]
         
         # LiDAR point cloud queries Camera Multi-view representation
@@ -81,12 +86,17 @@ class CrossAttentionFuser(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(True),
         )
+        if self.use_residual_img:
+            # Residual safeguard for image branch to avoid over-suppression.
+            self.residual_alpha = nn.Parameter(torch.tensor(float(residual_alpha_init)))
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
         img_feat, pts_feat = inputs[0], inputs[1]
         
         # Soft Alignment: LiDAR features acts as Query to adaptively highlight/query camera semantic regions
         aligned_img_feat = self.cross_attn(x_q=pts_feat, x_k=img_feat)
+        if self.use_residual_img:
+            aligned_img_feat = img_feat + self.residual_alpha * aligned_img_feat
         
         # Concatenate and fuse
         fused = self.fuser(torch.cat([aligned_img_feat, pts_feat], dim=1))
@@ -307,28 +317,33 @@ class TransFusionHead(nn.Module):
             
         heatmap = dense_heatmap.detach().sigmoid()
         objectness = dense_objectness.detach().sigmoid() # [NEW]
-        
+
         padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(objectness)
+        local_max = torch.zeros_like(heatmap)
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
-            objectness, kernel_size=self.nms_kernel_size, stride=1, padding=0)
+            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
         local_max[:, :, padding:(-padding),
                   padding:(-padding)] = local_max_inner
-        
-        objectness = objectness * (objectness == local_max)
-        objectness = objectness.view(batch_size, 1, -1)
+        # [RESTORED] Use heatmap (not objectness) for NMS and top-K selection
+        heatmap = heatmap * (heatmap == local_max)
+        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
-        # top num_proposals based on objectness
-        top_proposals = objectness.view(batch_size, -1).argsort(
+        # top num_proposals jointly across classes and spatial positions
+        top_proposals = heatmap.view(batch_size, -1).argsort(
             dim=-1, descending=True)[..., :self.num_proposals]
-        
-        top_proposals_index = top_proposals
-        
-        # Get implicit class from the semantic heatmap for class-encoding
-        flat_heatmap = heatmap.view(batch_size, self.num_classes, -1)
-        top_proposals_class = flat_heatmap.gather(
-            2, top_proposals_index[:, None, :].expand(-1, self.num_classes, -1)).argmax(dim=1)
+
+        top_proposals_class = top_proposals // heatmap.shape[-1]
+        top_proposals_index = top_proposals % heatmap.shape[-1]
+
+        # [NEW] Also compute objectness scores at selected positions (for open-world inference)
+        objectness_nms = torch.zeros_like(objectness)
+        obj_local_max_inner = F.max_pool2d(
+            objectness, kernel_size=self.nms_kernel_size, stride=1, padding=0)
+        objectness_nms[:, :, padding:(-padding),
+                       padding:(-padding)] = obj_local_max_inner
+        objectness = objectness * (objectness == objectness_nms)
+        objectness = objectness.view(batch_size, 1, -1)
             
         query_feat = fusion_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
@@ -371,7 +386,7 @@ class TransFusionHead(nn.Module):
             # for next level positional embedding
             query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
 
-        ret_dicts[0]['query_heatmap_score'] = flat_heatmap.gather(
+        ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
             index=top_proposals_index[:,
                                       None, :].expand(-1, self.num_classes,
                                                       -1),
@@ -665,8 +680,9 @@ class TransFusionHead(nn.Module):
         ious = torch.cat(res_tuple[4], dim=0)
         num_pos = np.sum(res_tuple[5])
         matched_ious = np.mean(res_tuple[6])
-        heatmap = torch.cat(res_tuple[7], dim=0)
-        objectness_heatmap = torch.cat(res_tuple[8], dim=0) # [NEW]
+        matched_iou_max = np.mean(res_tuple[7])
+        heatmap = torch.cat(res_tuple[8], dim=0)
+        objectness_heatmap = torch.cat(res_tuple[9], dim=0) # [NEW]
         return (
             labels,
             label_weights,
@@ -675,6 +691,7 @@ class TransFusionHead(nn.Module):
             ious,
             num_pos,
             matched_ious,
+            matched_iou_max,
             heatmap,
             objectness_heatmap,
         )
@@ -853,6 +870,7 @@ class TransFusionHead(nn.Module):
                                       center_int[[1, 0]], radius) # [NEW]
 
         mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
+        max_iou = ious.max()
         return (
             labels[None],
             label_weights[None],
@@ -861,6 +879,7 @@ class TransFusionHead(nn.Module):
             ious[None],
             int(pos_inds.shape[0]),
             float(mean_iou),
+            float(max_iou),
             heatmap[None],
             objectness_heatmap[None], # [NEW]
         )
@@ -896,6 +915,7 @@ class TransFusionHead(nn.Module):
             ious,
             num_pos,
             matched_ious,
+            matched_iou_max,
             heatmap,
             objectness_heatmap, # [NEW]
         ) = self.get_targets(batch_gt_instances_3d, preds_dicts[0])
@@ -998,5 +1018,20 @@ class TransFusionHead(nn.Module):
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
 
         loss_dict['matched_ious'] = layer_loss_cls.new_tensor(matched_ious)
+        loss_dict['matched_iou_max'] = layer_loss_cls.new_tensor(
+            matched_iou_max)
+        loss_dict['assign_num_pos'] = layer_loss_cls.new_tensor(
+            float(num_pos))
+
+        # Debug-only query stats for A/B diagnosis (no training objective impact).
+        if 'query_heatmap_score' in preds_dict:
+            query_heat = preds_dict['query_heatmap_score'].detach().max(
+                dim=1).values
+            loss_dict['dbg_query_heat_mean'] = query_heat.mean()
+            loss_dict['dbg_query_heat_max'] = query_heat.max()
+        if 'query_objectness_score' in preds_dict:
+            query_obj = preds_dict['query_objectness_score'].detach()
+            loss_dict['dbg_query_obj_mean'] = query_obj.mean()
+            loss_dict['dbg_query_obj_max'] = query_obj.max()
 
         return loss_dict
