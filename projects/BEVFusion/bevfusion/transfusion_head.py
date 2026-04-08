@@ -70,13 +70,34 @@ class CrossAttentionFuser(nn.Module):
     def __init__(self,
                  in_channels: List[int],
                  out_channels: int,
+                 use_geometry_mask: bool = False,
+                 geo_mask_tau: float = 0.10,
+                 geo_mask_lambda: float = 0.50,
+                 geo_mask_pool_kernel: int = 3,
+                 geo_mask_type: str = 'hard',
+                 geo_mask_temp: float = 0.10,
                  use_residual_img: bool = False,
                  residual_alpha_init: float = 0.1) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.use_geometry_mask = use_geometry_mask
+        self.geo_mask_tau = float(geo_mask_tau)
+        self.geo_mask_lambda = float(geo_mask_lambda)
+        self.geo_mask_pool_kernel = int(geo_mask_pool_kernel)
+        self.geo_mask_type = str(geo_mask_type).lower()
+        self.geo_mask_temp = float(geo_mask_temp)
+        if self.geo_mask_pool_kernel < 1:
+            raise ValueError('geo_mask_pool_kernel must be >= 1.')
+        if self.geo_mask_pool_kernel % 2 == 0:
+            raise ValueError('geo_mask_pool_kernel must be odd.')
+        if self.geo_mask_type not in ('hard', 'soft'):
+            raise ValueError("geo_mask_type must be 'hard' or 'soft'.")
+        if self.geo_mask_type == 'soft' and self.geo_mask_temp <= 0:
+            raise ValueError('geo_mask_temp must be > 0 when geo_mask_type=soft.')
         self.use_residual_img = use_residual_img
         img_channels, pts_channels = in_channels[0], in_channels[1]
+        self.latest_geo_mask_stats = None
         
         # LiDAR point cloud queries Camera Multi-view representation
         self.cross_attn = SpatialCrossAttention(pts_channels, img_channels, img_channels)
@@ -92,7 +113,38 @@ class CrossAttentionFuser(nn.Module):
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
         img_feat, pts_feat = inputs[0], inputs[1]
-        
+
+        if self.use_geometry_mask:
+            # Geometry existence mask from LiDAR BEV occupancy evidence.
+            geo_score = pts_feat.abs().amax(dim=1, keepdim=True)
+            if self.geo_mask_pool_kernel > 1:
+                pad = self.geo_mask_pool_kernel // 2
+                geo_score = F.max_pool2d(
+                    geo_score,
+                    kernel_size=self.geo_mask_pool_kernel,
+                    stride=1,
+                    padding=pad)
+            if self.geo_mask_type == 'soft':
+                geo_mask = torch.sigmoid(
+                    (geo_score - self.geo_mask_tau) / self.geo_mask_temp)
+            else:
+                geo_mask = (geo_score > self.geo_mask_tau).float()
+            img_feat = img_feat * (1.0 + self.geo_mask_lambda * geo_mask)
+            active = (geo_mask > 0.5).float()
+            nonzero = active.flatten(1).sum(dim=1).mean()
+            self.latest_geo_mask_stats = {
+                'ratio': active.mean().detach(),
+                'mean': geo_mask.mean().detach(),
+                'nonzero': nonzero.detach(),
+            }
+        else:
+            zero = img_feat.new_tensor(0.0)
+            self.latest_geo_mask_stats = {
+                'ratio': zero,
+                'mean': zero,
+                'nonzero': zero,
+            }
+
         # Soft Alignment: LiDAR features acts as Query to adaptively highlight/query camera semantic regions
         aligned_img_feat = self.cross_attn(x_q=pts_feat, x_k=img_feat)
         if self.use_residual_img:
@@ -247,6 +299,7 @@ class TransFusionHead(nn.Module):
 
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
+        self.latest_geo_mask_stats = None
 
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
@@ -1033,5 +1086,13 @@ class TransFusionHead(nn.Module):
             query_obj = preds_dict['query_objectness_score'].detach()
             loss_dict['dbg_query_obj_mean'] = query_obj.mean()
             loss_dict['dbg_query_obj_max'] = query_obj.max()
+        if getattr(self, 'latest_geo_mask_stats', None) is not None:
+            stats = self.latest_geo_mask_stats
+            if 'ratio' in stats:
+                loss_dict['dbg_geo_mask_ratio'] = stats['ratio']
+            if 'mean' in stats:
+                loss_dict['dbg_geo_mask_mean'] = stats['mean']
+            if 'nonzero' in stats:
+                loss_dict['dbg_geo_mask_nonzero'] = stats['nonzero']
 
         return loss_dict

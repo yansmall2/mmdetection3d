@@ -291,6 +291,11 @@ class BEVFusion(Base3DDetector):
 
         losses = dict()
         if self.with_bbox_head:
+            self.bbox_head.latest_geo_mask_stats = None
+            if self.fusion_layer is not None and hasattr(
+                    self.fusion_layer, 'latest_geo_mask_stats'):
+                self.bbox_head.latest_geo_mask_stats = (
+                    self.fusion_layer.latest_geo_mask_stats)
             bbox_loss = self.bbox_head.loss(feats, batch_data_samples)
 
         losses.update(bbox_loss)
