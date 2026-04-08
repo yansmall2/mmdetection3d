@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 from statistics import mean
+from typing import Dict, Iterable, Optional
 
 
 METRIC_KEYS = [
@@ -58,21 +59,84 @@ def summarize(rows):
     return summary, len(rows)
 
 
+def _scan_metrics_from_rows(rows: Iterable[dict]) -> Dict[str, float]:
+    out = {}
+    map_candidates = []
+    nds_candidates = []
+    for row in rows:
+        for key, value in row.items():
+            if not isinstance(value, (int, float)):
+                continue
+            key_l = key.lower()
+            if (
+                ("map" in key_l or "mean_ap" in key_l)
+                and "heatmap" not in key_l
+            ):
+                map_candidates.append(float(value))
+            if "nds" in key_l or "nd_score" in key_l:
+                nds_candidates.append(float(value))
+    if map_candidates:
+        out["bbox_mAP"] = map_candidates[-1]
+    if nds_candidates:
+        out["NDS"] = nds_candidates[-1]
+    return out
+
+
+def _scan_metrics_from_text(text: str) -> Dict[str, float]:
+    out = {}
+    patterns = {
+        "bbox_mAP": [
+            r"(?:bbox_mAP|mean_ap|(?:^|[/_])mAP)\s*[:=]\s*([0-9]*\.?[0-9]+)",
+        ],
+        "NDS": [
+            r"(?:\bNDS\b|nd_score)\s*[:=]\s*([0-9]*\.?[0-9]+)",
+        ],
+    }
+    for metric, pattern_list in patterns.items():
+        for pattern in pattern_list:
+            matches = re.findall(pattern, text, flags=re.IGNORECASE)
+            if matches:
+                out[metric] = float(matches[-1])
+                break
+    return out
+
+
+def _read_metrics_summary_json(work_dir: Path) -> Optional[Dict[str, float]]:
+    cands = sorted(work_dir.glob("**/metrics_summary.json"))
+    if not cands:
+        return None
+    try:
+        data = json.loads(cands[-1].read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+    out = {}
+    if "mean_ap" in data:
+        out["bbox_mAP"] = float(data["mean_ap"])
+    if "nd_score" in data:
+        out["NDS"] = float(data["nd_score"])
+    return out or None
+
+
 def find_last_val_metrics(work_dir: Path):
+    # Priority 1: official NuScenes metrics summary json (most reliable).
+    metrics = _read_metrics_summary_json(work_dir)
+    if metrics:
+        return metrics
+
+    # Priority 2: vis_data json rows.
+    vis_jsons = sorted(work_dir.glob("**/vis_data/*.json"))
+    for path in reversed(vis_jsons):
+        rows = load_jsonl(path)
+        metrics = _scan_metrics_from_rows(rows)
+        if metrics:
+            return metrics
+
+    # Priority 3: plain-text log parsing.
     log_files = sorted(work_dir.glob("**/*.log"))
     if not log_files:
         return {}
     text = log_files[-1].read_text(encoding="utf-8", errors="ignore")
-    patterns = {
-        "bbox_mAP": r"\bbbox_mAP\b[^0-9\-]*([0-9]*\.?[0-9]+)",
-        "NDS": r"\bNDS\b[^0-9\-]*([0-9]*\.?[0-9]+)",
-    }
-    out = {}
-    for k, p in patterns.items():
-        matches = re.findall(p, text)
-        if matches:
-            out[k] = float(matches[-1])
-    return out
+    return _scan_metrics_from_text(text)
 
 
 def print_summary(name, section, summary, n):

@@ -8,9 +8,12 @@ cd "$ROOT_DIR"
 # Example:
 #   PRETRAIN=/path/to/bevfusion_lidar_voxel...pth bash tools/analysis_tools/run_b_geomask_suite.sh
 PRETRAIN="${PRETRAIN:-}"
-PRETRAIN_OPT=()
+CFG_OPTS=(
+  "val_evaluator.version=v1.0-mini"
+  "test_evaluator.version=v1.0-mini"
+)
 if [[ -n "$PRETRAIN" ]]; then
-  PRETRAIN_OPT=(--cfg-options "load_from=${PRETRAIN}")
+  CFG_OPTS+=("load_from=${PRETRAIN}")
 fi
 
 CFG_B="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_nus-3d.py"
@@ -20,10 +23,10 @@ WD_B="work_dirs/abmini_cross_b"
 WD_BM="work_dirs/abmini_cross_b_geomask"
 
 echo "[1/3] Train B (CrossAttentionFuser baseline)"
-python tools/train.py "$CFG_B" --work-dir "$WD_B" "${PRETRAIN_OPT[@]}"
+python tools/train.py "$CFG_B" --work-dir "$WD_B" --cfg-options "${CFG_OPTS[@]}"
 
 echo "[2/3] Train B+M (Geometry-mask + CrossAttentionFuser)"
-python tools/train.py "$CFG_BM" --work-dir "$WD_BM" "${PRETRAIN_OPT[@]}"
+python tools/train.py "$CFG_BM" --work-dir "$WD_BM" --cfg-options "${CFG_OPTS[@]}"
 
 echo "[3/3] Compare B vs B+M (first/last/full windows)"
 python tools/analysis_tools/compare_ab_matched_ious.py \
