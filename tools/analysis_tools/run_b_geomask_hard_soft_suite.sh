@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 PRETRAIN="${PRETRAIN:-}"
 CFG_OPTS=(
-  "val_evaluator.version=v1.0-mini"
-  "test_evaluator.version=v1.0-mini"
+  "val_dataloader.dataset.metainfo.version=v1.0-mini"
+  "test_dataloader.dataset.metainfo.version=v1.0-mini"
 )
 if [[ -n "$PRETRAIN" ]]; then
   CFG_OPTS+=("load_from=${PRETRAIN}")

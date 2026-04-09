@@ -1,4 +1,4 @@
-_base_ = ['./bevfusion_lidar-cam_baseline_nus-3d.py']
+_base_ = ['./bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py']
 
 # A/B debug settings (mini-scale quick diagnosis)
 randomness = dict(seed=3407)
@@ -12,3 +12,8 @@ load_from = (
 
 # Ensure baseline fuser.
 model = dict(fusion_layer=dict(type='ConvFuser', in_channels=[80, 256], out_channels=256))
+
+# Force mini split version through dataset metainfo (compatible with this repo's
+# NuScenesMetric, which reads dataset_meta['version'] rather than metric args).
+val_dataloader = dict(dataset=dict(metainfo=dict(version='v1.0-mini')))
+test_dataloader = dict(dataset=dict(metainfo=dict(version='v1.0-mini')))

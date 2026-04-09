@@ -9,8 +9,8 @@ cd "$ROOT_DIR"
 #   PRETRAIN=/path/to/bevfusion_lidar_voxel...pth bash tools/analysis_tools/run_b_only_suite.sh
 PRETRAIN="${PRETRAIN:-}"
 CFG_OPTS=(
-  "val_evaluator.version=v1.0-mini"
-  "test_evaluator.version=v1.0-mini"
+  "val_dataloader.dataset.metainfo.version=v1.0-mini"
+  "test_dataloader.dataset.metainfo.version=v1.0-mini"
 )
 if [[ -n "$PRETRAIN" ]]; then
   CFG_OPTS+=("load_from=${PRETRAIN}")

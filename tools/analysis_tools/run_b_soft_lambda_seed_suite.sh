@@ -15,8 +15,8 @@ CFG_SOFT03="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_geomask_
 CFG_SOFT02="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_geomask_soft_lam02_nus-3d.py"
 
 BASE_CFG_OPTS=(
-  "val_evaluator.version=v1.0-mini"
-  "test_evaluator.version=v1.0-mini"
+  "val_dataloader.dataset.metainfo.version=v1.0-mini"
+  "test_dataloader.dataset.metainfo.version=v1.0-mini"
 )
 if [[ -n "$PRETRAIN" ]]; then
   BASE_CFG_OPTS+=("load_from=${PRETRAIN}")

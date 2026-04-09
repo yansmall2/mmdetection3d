@@ -17,3 +17,8 @@ model = dict(
         in_channels=[80, 256],
         out_channels=256,
         use_residual_img=False))
+
+# Force mini split version through dataset metainfo (compatible with this repo's
+# NuScenesMetric, which reads dataset_meta['version'] rather than metric args).
+val_dataloader = dict(dataset=dict(metainfo=dict(version='v1.0-mini')))
+test_dataloader = dict(dataset=dict(metainfo=dict(version='v1.0-mini')))

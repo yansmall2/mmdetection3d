@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 CFG_OPTS=(
-  "val_evaluator.version=v1.0-mini"
-  "test_evaluator.version=v1.0-mini"
+  "val_dataloader.dataset.metainfo.version=v1.0-mini"
+  "test_dataloader.dataset.metainfo.version=v1.0-mini"
 )
 
 CONV_CFG="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_conv_nus-3d.py"
