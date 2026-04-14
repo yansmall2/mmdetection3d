@@ -535,26 +535,43 @@ class TransFusionHead(nn.Module):
                 batch_center,
                 batch_height,
                 batch_vel,
-                filter=True,
+                filter=False,
             )
 
-            # [NEW] Open-World Reasoning Logic
-            obj_thresh = 0.5
-            cls_thresh = 0.3
-            unknown_label_id = self.num_classes # Representing 'Unknown' class
+            # [NEW] Open-World Reasoning Logic (configurable for dual-track eval)
+            open_world_mode = self.test_cfg.get('open_world_mode', 'open_world')
+            enable_unknown = open_world_mode != 'known_only'
+            obj_thresh = float(self.test_cfg.get('unknown_obj_thresh', 0.5))
+            cls_thresh = float(self.test_cfg.get('unknown_cls_thresh', 0.3))
+            unknown_label_id = int(
+                self.test_cfg.get('unknown_label_id', self.num_classes))
             for i in range(batch_size):
-                obj_scores_i = batch_obj[i, 0] # shape: [num_proposals]
-                max_semantic_scores_i = batch_score[i].max(dim=0).values # shape: [num_proposals]
-                # Identify unknown objects
-                is_unknown = (obj_scores_i > obj_thresh) & (max_semantic_scores_i < cls_thresh)
-                
-                # We need to update labels and scores in temp[i]
-                # temp[i]['labels'] has shape [num_proposals]
-                temp[i]['labels'][is_unknown] = unknown_label_id
-                
-                # Update the score to be the objectness score for unknown objects
-                # so they are not filtered out by low semantic score
-                temp[i]['scores'][is_unknown] = obj_scores_i[is_unknown]
+                obj_scores_i = batch_obj[i, 0]  # shape: [num_proposals]
+                max_semantic_scores_i = batch_score[i].max(dim=0).values
+                if enable_unknown:
+                    # Identify unknown objects
+                    is_unknown = ((obj_scores_i > obj_thresh)
+                                  & (max_semantic_scores_i < cls_thresh))
+                    # Update labels and scores before filtering so mask shapes match.
+                    temp[i]['labels'][is_unknown] = unknown_label_id
+                    temp[i]['scores'][is_unknown] = obj_scores_i[is_unknown]
+
+                # Apply the same bbox coder filtering after unknown update.
+                keep_mask = torch.ones_like(
+                    temp[i]['scores'], dtype=torch.bool)
+                if self.bbox_coder.post_center_range is not None:
+                    post_center_range = temp[i]['bboxes'].new_tensor(
+                        self.bbox_coder.post_center_range)
+                    keep_mask &= (temp[i]['bboxes'][..., :3] >=
+                                  post_center_range[:3]).all(dim=-1)
+                    keep_mask &= (temp[i]['bboxes'][..., :3] <=
+                                  post_center_range[3:]).all(dim=-1)
+                if self.bbox_coder.score_threshold is not None:
+                    keep_mask &= temp[i]['scores'] > self.bbox_coder.score_threshold
+
+                temp[i]['bboxes'] = temp[i]['bboxes'][keep_mask]
+                temp[i]['scores'] = temp[i]['scores'][keep_mask]
+                temp[i]['labels'] = temp[i]['labels'][keep_mask]
 
             if self.test_cfg['dataset'] == 'nuScenes':
                 self.tasks = [
@@ -576,14 +593,15 @@ class TransFusionHead(nn.Module):
                         indices=[9],
                         radius=0.175,
                     ),
-                    # [NEW] Task for Unknown Obstacles
-                    dict(
-                        num_class=1,
-                        class_names=['unknown'],
-                        indices=[unknown_label_id],
-                        radius=-1,
-                    ),
                 ]
+                if enable_unknown:
+                    self.tasks.append(
+                        dict(
+                            num_class=1,
+                            class_names=['unknown'],
+                            indices=[unknown_label_id],
+                            radius=-1,
+                        ))
             elif self.test_cfg['dataset'] == 'Waymo':
                 self.tasks = [
                     dict(
@@ -601,13 +619,14 @@ class TransFusionHead(nn.Module):
                         class_names=['Cyclist'],
                         indices=[2],
                         radius=0.7),
-                    # [NEW] Task for Unknown Obstacles
-                    dict(
-                        num_class=1,
-                        class_names=['Unknown'],
-                        indices=[unknown_label_id],
-                        radius=0.7),
                 ]
+                if enable_unknown:
+                    self.tasks.append(
+                        dict(
+                            num_class=1,
+                            class_names=['Unknown'],
+                            indices=[unknown_label_id],
+                            radius=0.7))
 
             ret_layer = []
             for i in range(batch_size):
