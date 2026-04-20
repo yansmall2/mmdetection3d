@@ -19,6 +19,40 @@ from mmdet3d.registry import METRICS
 from mmdet3d.structures import (CameraInstance3DBoxes, LiDARInstance3DBoxes,
                                 bbox3d2result, xywhr2xyxyr)
 
+_UNKNOWN_CLASS_NAMES = {'unknown', 'Unknown'}
+
+
+def _label_to_name(label: int, classes: List[str]) -> Optional[str]:
+    if label < 0:
+        return None
+    if label < len(classes):
+        return classes[label]
+    if label == len(classes):
+        return 'unknown'
+    return None
+
+
+def _class_det_range(label: int, classes: List[str],
+                     cls_range_map: Dict[str, float]) -> Optional[float]:
+    class_name = _label_to_name(label, classes)
+    if class_name is None:
+        return None
+    if class_name in cls_range_map:
+        return cls_range_map[class_name]
+    if class_name in _UNKNOWN_CLASS_NAMES and cls_range_map:
+        return max(cls_range_map.values())
+    return None
+
+
+def _holdout_index_to_name(classes: List[str],
+                           holdout_classes: List[str]) -> Dict[int, str]:
+    holdout_set = set(holdout_classes)
+    return {
+        idx: class_name
+        for idx, class_name in enumerate(classes)
+        if class_name in holdout_set
+    }
+
 
 @METRICS.register_module()
 class NuScenesMetric(BaseMetric):
@@ -95,6 +129,10 @@ class NuScenesMetric(BaseMetric):
                  format_only: bool = False,
                  jsonfile_prefix: Optional[str] = None,
                  eval_version: str = 'detection_cvpr_2019',
+                 holdout_classes: Optional[List[str]] = None,
+                 unknown_iou_thr: float = 0.25,
+                 unknown_score_thr: float = 0.1,
+                 unknown_label_id: Optional[int] = None,
                  collect_device: str = 'cpu',
                  backend_args: Optional[dict] = None) -> None:
         self.default_prefix = 'NuScenes metric'
@@ -121,6 +159,10 @@ class NuScenesMetric(BaseMetric):
 
         self.eval_version = eval_version
         self.eval_detection_configs = config_factory(self.eval_version)
+        self.holdout_classes = list(holdout_classes) if holdout_classes else []
+        self.unknown_iou_thr = float(unknown_iou_thr)
+        self.unknown_score_thr = float(unknown_score_thr)
+        self.unknown_label_id = unknown_label_id
 
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
         """Process one batch of data samples and predictions.
@@ -158,7 +200,7 @@ class NuScenesMetric(BaseMetric):
         """
         logger: MMLogger = MMLogger.get_current_instance()
 
-        classes = self.dataset_meta['classes']
+        classes = list(self.dataset_meta['classes'])
         self.version = self.dataset_meta['version']
         # load annotations
         self.data_infos = load(
@@ -178,6 +220,11 @@ class NuScenesMetric(BaseMetric):
                 result_dict, classes=classes, metric=metric, logger=logger)
             for result in ap_dict:
                 metric_dict[result] = ap_dict[result]
+
+        open_world_metric_dict = self._compute_open_world_metrics(
+            results, classes)
+        metric_dict.update(open_world_metric_dict)
+        self._dump_open_world_metrics(result_dict, open_world_metric_dict)
 
         if tmp_dir is not None:
             tmp_dir.cleanup()
@@ -208,6 +255,169 @@ class NuScenesMetric(BaseMetric):
                 result_dict[name], classes=classes, result_name=name)
             metric_dict.update(ret_dict)
         return metric_dict
+
+    def _dump_open_world_metrics(self, result_dict: dict,
+                                 metrics: Dict[str, float]) -> None:
+        if not metrics or not result_dict:
+            return
+        output_dir = osp.dirname(next(iter(result_dict.values())))
+        mmengine.dump(
+            self._build_open_world_dump(metrics),
+            osp.join(output_dir, 'open_world_metrics.json'))
+
+    def _dump_result_files(self, jsonfile_prefix: str, nusc_annos: dict,
+                           analysis_annos: dict) -> str:
+        nusc_submissions = {
+            'meta': self.modality,
+            'results': nusc_annos,
+        }
+        analysis_submissions = {
+            'meta': self.modality,
+            'results': analysis_annos,
+        }
+
+        mmengine.mkdir_or_exist(jsonfile_prefix)
+        res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
+        analysis_path = osp.join(jsonfile_prefix,
+                                 'results_nusc_with_unknown.json')
+        print(f'Results writes to {res_path}')
+        mmengine.dump(nusc_submissions, res_path)
+        print(f'Analysis results write to {analysis_path}')
+        mmengine.dump(analysis_submissions, analysis_path)
+        return res_path
+
+    def _compute_open_world_metrics(self, results: List[dict],
+                                    classes: List[str]) -> Dict[str, float]:
+        if not self.holdout_classes:
+            return {}
+
+        holdout_indices = _holdout_index_to_name(classes, self.holdout_classes)
+        if not holdout_indices:
+            return {}
+
+        unknown_label_id = (
+            len(classes) if self.unknown_label_id is None else
+            int(self.unknown_label_id))
+        total_gt = 0
+        total_pred = 0
+        total_matched = 0
+        per_class = {
+            class_name: dict(gt=0, matched=0)
+            for class_name in holdout_indices.values()
+        }
+
+        for result in results:
+            sample_idx = result['sample_idx']
+            info = self.data_infos[sample_idx]
+            instances = info.get('instances', [])
+
+            gt_boxes = []
+            gt_names = []
+            for instance in instances:
+                label = instance.get('bbox_label_3d', -1)
+                if label not in holdout_indices:
+                    continue
+                bbox = instance.get('bbox_3d')
+                if bbox is None:
+                    continue
+                gt_boxes.append(bbox)
+                gt_name = holdout_indices[label]
+                gt_names.append(gt_name)
+                per_class[gt_name]['gt'] += 1
+
+            if not gt_boxes:
+                continue
+
+            pred_instances = result['pred_instances_3d']
+            pred_labels = pred_instances['labels_3d']
+            pred_scores = pred_instances['scores_3d']
+            unknown_mask = pred_labels == unknown_label_id
+            unknown_mask &= pred_scores >= self.unknown_score_thr
+            pred_unknown_boxes = pred_instances['bboxes_3d'][unknown_mask]
+
+            total_gt += len(gt_boxes)
+            pred_count = int(unknown_mask.sum().item())
+            total_pred += pred_count
+
+            if len(pred_unknown_boxes) == 0:
+                continue
+
+            gt_boxes_tensor = torch.as_tensor(
+                gt_boxes,
+                dtype=pred_unknown_boxes.tensor.dtype,
+                device=pred_unknown_boxes.tensor.device)
+            gt_boxes_3d = LiDARInstance3DBoxes(
+                gt_boxes_tensor,
+                box_dim=gt_boxes_tensor.shape[-1],
+                origin=(0.5, 0.5, 0.5))
+            overlaps = gt_boxes_3d.overlaps(
+                gt_boxes_3d, pred_unknown_boxes, mode='iou')
+            if overlaps.numel() == 0:
+                continue
+
+            matched_pred_indices = set()
+            for gt_idx in range(overlaps.shape[0]):
+                best_pred_idx = -1
+                best_iou = self.unknown_iou_thr
+                for pred_idx in range(overlaps.shape[1]):
+                    if pred_idx in matched_pred_indices:
+                        continue
+                    iou = float(overlaps[gt_idx, pred_idx].item())
+                    if iou >= best_iou:
+                        best_iou = iou
+                        best_pred_idx = pred_idx
+                if best_pred_idx >= 0:
+                    matched_pred_indices.add(best_pred_idx)
+                    total_matched += 1
+                    per_class[gt_names[gt_idx]]['matched'] += 1
+
+        metrics = {
+            'OpenWorld/unknown_gt_count': float(total_gt),
+            'OpenWorld/unknown_pred_count': float(total_pred),
+            'OpenWorld/unknown_matched_count': float(total_matched),
+            f'OpenWorld/unknown_recall@{self.unknown_iou_thr:.2f}':
+            (total_matched / total_gt if total_gt > 0 else 0.0),
+        }
+        for class_name, counts in per_class.items():
+            gt_count = counts['gt']
+            metrics[f'OpenWorld/{class_name}_gt_count'] = float(gt_count)
+            metrics[
+                f'OpenWorld/{class_name}_matched_count'] = float(
+                    counts['matched'])
+            metrics[
+                f'OpenWorld/{class_name}_unknown_recall@{self.unknown_iou_thr:.2f}'
+            ] = (counts['matched'] / gt_count if gt_count > 0 else 0.0)
+        return metrics
+
+    def _build_open_world_dump(self, metrics: Dict[str, float]) -> Dict[str, Union[
+            float, int, List[str], Dict[str, Dict[str, float]]]]:
+        if not metrics:
+            return {}
+
+        recall_key = f'OpenWorld/unknown_recall@{self.unknown_iou_thr:.2f}'
+        dump = dict(
+            holdout_classes=self.holdout_classes,
+            unknown_iou_thr=self.unknown_iou_thr,
+            unknown_score_thr=self.unknown_score_thr,
+            unknown_gt_count=int(metrics.get('OpenWorld/unknown_gt_count', 0)),
+            unknown_pred_count=int(
+                metrics.get('OpenWorld/unknown_pred_count', 0)),
+            unknown_matched_count=int(
+                metrics.get('OpenWorld/unknown_matched_count', 0)),
+            unknown_recall=float(metrics.get(recall_key, 0.0)),
+            per_class={})
+        for class_name in self.holdout_classes:
+            class_recall_key = (
+                f'OpenWorld/{class_name}_unknown_recall@'
+                f'{self.unknown_iou_thr:.2f}')
+            dump['per_class'][class_name] = dict(
+                gt_count=int(
+                    metrics.get(f'OpenWorld/{class_name}_gt_count', 0)),
+                matched_count=int(
+                    metrics.get(
+                        f'OpenWorld/{class_name}_matched_count', 0)),
+                unknown_recall=float(metrics.get(class_recall_key, 0.0)))
+        return dump
 
     def _evaluate_single(
             self,
@@ -341,7 +551,7 @@ class NuScenesMetric(BaseMetric):
                     AttrMapping_rev2[attr_idx] == 'vehicle.stopped':
                 return AttrMapping_rev2[attr_idx]
             else:
-                return self.DefaultAttribute[label_name]
+                return self.DefaultAttribute.get(label_name, '')
         elif label_name == 'pedestrian':
             if AttrMapping_rev2[attr_idx] == 'pedestrian.moving' or \
                 AttrMapping_rev2[attr_idx] == 'pedestrian.standing' or \
@@ -349,15 +559,15 @@ class NuScenesMetric(BaseMetric):
                     'pedestrian.sitting_lying_down':
                 return AttrMapping_rev2[attr_idx]
             else:
-                return self.DefaultAttribute[label_name]
+                return self.DefaultAttribute.get(label_name, '')
         elif label_name == 'bicycle' or label_name == 'motorcycle':
             if AttrMapping_rev2[attr_idx] == 'cycle.with_rider' or \
                     AttrMapping_rev2[attr_idx] == 'cycle.without_rider':
                 return AttrMapping_rev2[attr_idx]
             else:
-                return self.DefaultAttribute[label_name]
+                return self.DefaultAttribute.get(label_name, '')
         else:
-            return self.DefaultAttribute[label_name]
+            return self.DefaultAttribute.get(label_name, '')
 
     def _format_camera_bbox(self,
                             results: List[dict],
@@ -379,6 +589,7 @@ class NuScenesMetric(BaseMetric):
             str: Path of the output json file.
         """
         nusc_annos = {}
+        analysis_annos = {}
 
         print('Start to convert detection format...')
 
@@ -407,6 +618,7 @@ class NuScenesMetric(BaseMetric):
 
             # need to merge results from images of the same sample
             annos = []
+            analysis_sample_annos = []
             boxes, attrs = output_to_nusc_box(det)
             sample_token = self.data_infos[frame_sample_idx]['token']
             camera_type = camera_types[camera_type_id]
@@ -453,7 +665,9 @@ class NuScenesMetric(BaseMetric):
                 self.eval_detection_configs)
 
             for i, box in enumerate(boxes):
-                name = classes[box.label]
+                name = _label_to_name(box.label, classes)
+                if name is None:
+                    continue
                 attr = self.get_attr_name(attrs[i], name)
                 nusc_anno = dict(
                     sample_token=sample_token,
@@ -464,23 +678,21 @@ class NuScenesMetric(BaseMetric):
                     detection_name=name,
                     detection_score=box.score,
                     attribute_name=attr)
-                annos.append(nusc_anno)
+                analysis_sample_annos.append(nusc_anno)
+                if name in classes:
+                    annos.append(nusc_anno)
             # other views results of the same frame should be concatenated
             if sample_token in nusc_annos:
                 nusc_annos[sample_token].extend(annos)
             else:
                 nusc_annos[sample_token] = annos
+            if sample_token in analysis_annos:
+                analysis_annos[sample_token].extend(analysis_sample_annos)
+            else:
+                analysis_annos[sample_token] = analysis_sample_annos
 
-        nusc_submissions = {
-            'meta': self.modality,
-            'results': nusc_annos,
-        }
-
-        mmengine.mkdir_or_exist(jsonfile_prefix)
-        res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
-        print(f'Results writes to {res_path}')
-        mmengine.dump(nusc_submissions, res_path)
-        return res_path
+        return self._dump_result_files(jsonfile_prefix, nusc_annos,
+                                       analysis_annos)
 
     def _format_lidar_bbox(self,
                            results: List[dict],
@@ -502,10 +714,12 @@ class NuScenesMetric(BaseMetric):
             str: Path of the output json file.
         """
         nusc_annos = {}
+        analysis_annos = {}
 
         print('Start to convert detection format...')
         for i, det in enumerate(mmengine.track_iter_progress(results)):
             annos = []
+            analysis_sample_annos = []
             boxes, attrs = output_to_nusc_box(det)
             sample_idx = sample_idx_list[i]
             sample_token = self.data_infos[sample_idx]['token']
@@ -513,7 +727,9 @@ class NuScenesMetric(BaseMetric):
                                              boxes, classes,
                                              self.eval_detection_configs)
             for i, box in enumerate(boxes):
-                name = classes[box.label]
+                name = _label_to_name(box.label, classes)
+                if name is None:
+                    continue
                 if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
                     if name in [
                             'car',
@@ -526,14 +742,14 @@ class NuScenesMetric(BaseMetric):
                     elif name in ['bicycle', 'motorcycle']:
                         attr = 'cycle.with_rider'
                     else:
-                        attr = self.DefaultAttribute[name]
+                        attr = self.DefaultAttribute.get(name, '')
                 else:
                     if name in ['pedestrian']:
                         attr = 'pedestrian.standing'
                     elif name in ['bus']:
                         attr = 'vehicle.stopped'
                     else:
-                        attr = self.DefaultAttribute[name]
+                        attr = self.DefaultAttribute.get(name, '')
 
                 nusc_anno = dict(
                     sample_token=sample_token,
@@ -544,17 +760,13 @@ class NuScenesMetric(BaseMetric):
                     detection_name=name,
                     detection_score=box.score,
                     attribute_name=attr)
-                annos.append(nusc_anno)
+                analysis_sample_annos.append(nusc_anno)
+                if name in classes:
+                    annos.append(nusc_anno)
             nusc_annos[sample_token] = annos
-        nusc_submissions = {
-            'meta': self.modality,
-            'results': nusc_annos,
-        }
-        mmengine.mkdir_or_exist(jsonfile_prefix)
-        res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
-        print(f'Results writes to {res_path}')
-        mmengine.dump(nusc_submissions, res_path)
-        return res_path
+            analysis_annos[sample_token] = analysis_sample_annos
+        return self._dump_result_files(jsonfile_prefix, nusc_annos,
+                                       analysis_annos)
 
 
 def output_to_nusc_box(
@@ -656,7 +868,9 @@ def lidar_nusc_box_to_global(
         # filter det in ego.
         cls_range_map = eval_configs.class_range
         radius = np.linalg.norm(box.center[:2], 2)
-        det_range = cls_range_map[classes[box.label]]
+        det_range = _class_det_range(box.label, classes, cls_range_map)
+        if det_range is None:
+            continue
         if radius > det_range:
             continue
         # Move box to global coord system
@@ -702,7 +916,9 @@ def cam_nusc_box_to_global(
         # filter det in ego.
         cls_range_map = eval_configs.class_range
         radius = np.linalg.norm(box.center[:2], 2)
-        det_range = cls_range_map[classes[box.label]]
+        det_range = _class_det_range(box.label, classes, cls_range_map)
+        if det_range is None:
+            continue
         if radius > det_range:
             continue
         # Move box to global coord system
@@ -742,7 +958,9 @@ def global_nusc_box_to_cam(info: dict, boxes: List[NuScenesBox],
         # filter det in ego.
         cls_range_map = eval_configs.class_range
         radius = np.linalg.norm(box.center[:2], 2)
-        det_range = cls_range_map[classes[box.label]]
+        det_range = _class_det_range(box.label, classes, cls_range_map)
+        if det_range is None:
+            continue
         if radius > det_range:
             continue
         # Move box to camera coord system

@@ -8,6 +8,12 @@ PRETRAIN="${PRETRAIN:-}"
 SEED="${SEED:-3409}"
 PILOT_TAG="${PILOT_TAG:-ow_pilot_$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-work_dirs/${PILOT_TAG}}"
+HOLDOUT_CLASSES_CFG="${HOLDOUT_CLASSES_CFG:-['construction_vehicle']}"
+UNKNOWN_OBJ_THRESH="${UNKNOWN_OBJ_THRESH:-0.5}"
+UNKNOWN_CLS_THRESH="${UNKNOWN_CLS_THRESH:-0.3}"
+UNKNOWN_LABEL_ID="${UNKNOWN_LABEL_ID:-10}"
+UNKNOWN_IOU_THR="${UNKNOWN_IOU_THR:-0.25}"
+UNKNOWN_SCORE_THR="${UNKNOWN_SCORE_THR:-0.1}"
 
 if [[ -z "$PRETRAIN" ]]; then
   echo "[ERROR] PRETRAIN is empty. Please set PRETRAIN=/abs/path/to/bevfusion_ckpt.pth"
@@ -25,6 +31,15 @@ COMMON_CFG_OPTS=(
   "test_dataloader.dataset.metainfo.version=v1.0-mini"
   "load_from=${PRETRAIN}"
   "randomness.seed=${SEED}"
+  "train_dataloader.dataset.dataset.holdout_classes=${HOLDOUT_CLASSES_CFG}"
+  "val_evaluator.holdout_classes=${HOLDOUT_CLASSES_CFG}"
+  "test_evaluator.holdout_classes=${HOLDOUT_CLASSES_CFG}"
+  "val_evaluator.unknown_iou_thr=${UNKNOWN_IOU_THR}"
+  "test_evaluator.unknown_iou_thr=${UNKNOWN_IOU_THR}"
+  "val_evaluator.unknown_score_thr=${UNKNOWN_SCORE_THR}"
+  "test_evaluator.unknown_score_thr=${UNKNOWN_SCORE_THR}"
+  "val_evaluator.unknown_label_id=${UNKNOWN_LABEL_ID}"
+  "test_evaluator.unknown_label_id=${UNKNOWN_LABEL_ID}"
 )
 
 CFG_B="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_nus-3d.py"
@@ -57,11 +72,19 @@ run_eval_mode() {
   local ckpt="$2"
   local eval_dir="$3"
   local mode="$4"
+  local export_dir="$eval_dir/nusc_exports"
 
   mkdir -p "$eval_dir"
+  mkdir -p "$export_dir"
   python tools/test.py "$cfg" "$ckpt" \
     --work-dir "$eval_dir" \
-    --cfg-options "${COMMON_CFG_OPTS[@]}" "model.bbox_head.test_cfg.open_world_mode=${mode}"
+    --cfg-options \
+      "${COMMON_CFG_OPTS[@]}" \
+      "model.bbox_head.test_cfg.open_world_mode=${mode}" \
+      "model.bbox_head.test_cfg.unknown_obj_thresh=${UNKNOWN_OBJ_THRESH}" \
+      "model.bbox_head.test_cfg.unknown_cls_thresh=${UNKNOWN_CLS_THRESH}" \
+      "model.bbox_head.test_cfg.unknown_label_id=${UNKNOWN_LABEL_ID}" \
+      "test_evaluator.jsonfile_prefix=${export_dir}"
 }
 
 for i in "${!exp_names[@]}"; do

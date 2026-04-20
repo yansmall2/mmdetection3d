@@ -39,6 +39,14 @@ for seed in $SEEDS; do
   python tools/train.py "$CFG_SOFT02" --work-dir "$WD02" \
     --cfg-options "${BASE_CFG_OPTS[@]}" "randomness.seed=${seed}"
 
+  HAVE_A="$(find "$WD05" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
+  HAVE_B="$(find "$WD03" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
+  HAVE_C="$(find "$WD02" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
+  if [[ -z "$HAVE_A" || -z "$HAVE_B" || -z "$HAVE_C" ]]; then
+    echo "[seed=${seed}] skip compare: missing vis_data json in one or more work_dirs."
+    continue
+  fi
+
   echo "[seed=${seed}] [4/4] Compare soft lambdas (0.5 vs 0.3 vs 0.2)"
   python tools/analysis_tools/compare_ab_matched_ious.py \
     --exp-a "$WD05" \

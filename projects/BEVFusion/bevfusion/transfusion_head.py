@@ -1040,6 +1040,21 @@ class TransFusionHead(nn.Module):
                 avg_factor=max(num_pos, 1),
             )
 
+            # [NEW] Proposal-level Objectness BCE Loss
+            # shape: [bs, 1, num_proposals] -> [bs * num_proposals]
+            layer_obj_score = preds_dict['objectness'][..., idx_layer *
+                                                       self.num_proposals:(idx_layer +
+                                                                           1) *
+                                                       self.num_proposals, ]
+            layer_obj_score = layer_obj_score.permute(0, 2, 1).reshape(-1)
+            layer_obj_targets = (layer_labels < self.num_classes).float()
+            layer_loss_obj = F.binary_cross_entropy_with_logits(
+                layer_obj_score.float(),
+                layer_obj_targets,
+                weight=layer_label_weights.float(),
+                reduction='sum'
+            ) / max(num_pos, 1)
+
             layer_center = preds_dict['center'][..., idx_layer *
                                                 self.num_proposals:(idx_layer +
                                                                     1) *
@@ -1086,6 +1101,7 @@ class TransFusionHead(nn.Module):
                 avg_factor=max(num_pos, 1))
 
             loss_dict[f'{prefix}_loss_cls'] = layer_loss_cls
+            loss_dict[f'{prefix}_loss_obj'] = layer_loss_obj # [NEW]
             loss_dict[f'{prefix}_loss_bbox'] = layer_loss_bbox
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
 
