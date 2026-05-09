@@ -171,6 +171,8 @@ class TransFusionHead(nn.Module):
         decoder_layer=dict(),
         num_heads=8,
         nms_kernel_size=1,
+        obj_nms_kernel_size=5,
+        num_unknown_proposals=25,
         bn_momentum=0.1,
         # config for FFN
         common_heads=dict(),
@@ -182,6 +184,11 @@ class TransFusionHead(nn.Module):
         loss_cls=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
         loss_bbox=dict(type='mmdet.L1Loss', reduction='mean'),
         loss_heatmap=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
+        objectness_dense_supervision=True,
+        objectness_dense_loss_weight=1.0,
+        objectness_query_loss_weight=1.0,
+        objectness_bce_pos_weight=1.0,
+        objectness_use_query_seed_score=True,
         # others
         train_cfg=None,
         test_cfg=None,
@@ -197,6 +204,8 @@ class TransFusionHead(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.bn_momentum = bn_momentum
         self.nms_kernel_size = nms_kernel_size
+        self.obj_nms_kernel_size = obj_nms_kernel_size
+        self.num_unknown_proposals = int(num_unknown_proposals)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
@@ -206,6 +215,18 @@ class TransFusionHead(nn.Module):
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_bbox = MODELS.build(loss_bbox)
         self.loss_heatmap = MODELS.build(loss_heatmap)
+        self.objectness_dense_supervision = bool(objectness_dense_supervision)
+        self.objectness_dense_loss_weight = float(objectness_dense_loss_weight)
+        self.objectness_query_loss_weight = float(objectness_query_loss_weight)
+        self.objectness_bce_pos_weight = float(objectness_bce_pos_weight)
+        self.objectness_use_query_seed_score = bool(
+            objectness_use_query_seed_score)
+        if self.objectness_dense_loss_weight < 0:
+            raise ValueError('objectness_dense_loss_weight must be >= 0.')
+        if self.objectness_query_loss_weight < 0:
+            raise ValueError('objectness_query_loss_weight must be >= 0.')
+        if self.objectness_bce_pos_weight <= 0:
+            raise ValueError('objectness_bce_pos_weight must be > 0.')
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.sampling = False
@@ -266,6 +287,8 @@ class TransFusionHead(nn.Module):
         self.objectness_head = nn.Sequential(*obj_layers)
         
         self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
+        self.objectness_token = nn.Parameter(
+            torch.zeros(1, hidden_channel))
 
         # transformer decoder layers for object query with LiDAR feature
         self.decoder = nn.ModuleList()
@@ -288,7 +311,21 @@ class TransFusionHead(nn.Module):
                 ))
 
         self.init_weights()
+        self._init_objectness_prior_bias()
         self._init_assigner_sampler()
+
+    def _init_objectness_prior_bias(self, prior_prob: float = 0.10) -> None:
+        """Init dense objectness head's final conv bias so sigmoid ≈ prior_prob.
+
+        Matches SeparateHead.init_bias default (-2.19 ≈ 0.10) so the
+        objectness heatmap starts at the same scale as the classification
+        heatmap and neither dominates the joint Top-K selection.
+        """
+        import math
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        final_conv = self.objectness_head[-1]
+        nn.init.constant_(final_conv.bias, bias_value)
+        nn.init.normal_(final_conv.weight, mean=0.0, std=0.01)
 
         # Position Embedding for Cross-Attention, which is re-used during training # noqa: E501
         x_size = self.test_cfg['grid_size'][0] // self.test_cfg[
@@ -366,50 +403,123 @@ class TransFusionHead(nn.Module):
         #################################
         with torch.autocast('cuda', enabled=False):
             dense_heatmap = self.heatmap_head(fusion_feat.float())
-            dense_objectness = self.objectness_head(fusion_feat.float()) # [NEW]
-            
-        heatmap = dense_heatmap.detach().sigmoid()
-        objectness = dense_objectness.detach().sigmoid() # [NEW]
+            dense_objectness = self.objectness_head(fusion_feat.float())
 
+        # 1) Classification score (per-class)
+        cls_score = dense_heatmap.detach().sigmoid()        # [B, C, H, W]
+
+        # 2) Uncertainty (unknown = no class is confident)
+        uncertainty = 1.0 - cls_score.max(dim=1, keepdim=True)[0]  # [B, 1, H, W]
+
+        # 3) Objectness (detached — gradient only through its own loss)
+        obj = dense_objectness.detach().sigmoid()            # [B, 1, H, W]
+
+        # 4) Unknown heatmap = uncertainty × sqrt(physical_prior) × (1 - max_cls)
+        #    physical_prior (= dense_objectness) biases toward foreground regions,
+        #    preventing empty-space regions from being selected as unknown proposals.
+        #    sqrt softens the physical prior to avoid dominance early in training.
+        unknown_heatmap = uncertainty * torch.sqrt(obj) * (1.0 - cls_score.max(dim=1, keepdim=True)[0])
+
+        # --- Per-class NMS for known query selection ---
         padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
-        # equals to nms radius = voxel_size * out_size_factor * kenel_size
-        local_max_inner = F.max_pool2d(
-            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
-        local_max[:, :, padding:(-padding),
-                  padding:(-padding)] = local_max_inner
-        # [RESTORED] Use heatmap (not objectness) for NMS and top-K selection
-        heatmap = heatmap * (heatmap == local_max)
-        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
+        if padding == 0:
+            cls_local_max = F.max_pool2d(
+                cls_score, kernel_size=self.nms_kernel_size,
+                stride=1, padding=0)
+        else:
+            cls_local_max = torch.zeros_like(cls_score)
+            cls_local_max_inner = F.max_pool2d(
+                cls_score, kernel_size=self.nms_kernel_size,
+                stride=1, padding=0)
+            cls_local_max[:, :, padding:(-padding),
+                          padding:(-padding)] = cls_local_max_inner
+        cls_nms = cls_score * (cls_score == cls_local_max)  # [B, C, H, W]
 
-        # top num_proposals jointly across classes and spatial positions
-        top_proposals = heatmap.view(batch_size, -1).argsort(
-            dim=-1, descending=True)[..., :self.num_proposals]
+        # --- Unknown NMS (single-channel) ---
+        obj_padding = self.obj_nms_kernel_size // 2
+        if obj_padding == 0:
+            unknown_nms = unknown_heatmap
+        else:
+            obj_local_max = torch.zeros_like(unknown_heatmap)
+            obj_local_max_inner = F.max_pool2d(
+                unknown_heatmap, kernel_size=self.obj_nms_kernel_size,
+                stride=1, padding=0)
+            obj_local_max[:, :, obj_padding:(-obj_padding),
+                          obj_padding:(-obj_padding)] = obj_local_max_inner
+            unknown_nms = unknown_heatmap * (unknown_heatmap == obj_local_max)
 
-        top_proposals_class = top_proposals // heatmap.shape[-1]
-        top_proposals_index = top_proposals % heatmap.shape[-1]
+        # --- Split Top-K: known + unknown, no joint competition ---
+        num_spatial = cls_nms.shape[-1] * cls_nms.shape[-2]
+        num_cls_proposals = self.num_proposals - self.num_unknown_proposals
 
-        # [NEW] Also compute objectness scores at selected positions (for open-world inference)
-        objectness_nms = torch.zeros_like(objectness)
-        obj_local_max_inner = F.max_pool2d(
-            objectness, kernel_size=self.nms_kernel_size, stride=1, padding=0)
-        objectness_nms[:, :, padding:(-padding),
-                       padding:(-padding)] = obj_local_max_inner
-        objectness = objectness * (objectness == objectness_nms)
-        objectness = objectness.view(batch_size, 1, -1)
-            
+        # Top-K from per-class cls_nms × foreground prior (sqrt(obj))
+        # Keep per-class structure for class diversity; add obj to suppress
+        # empty-space peaks that waste decoder capacity early in training.
+        cls_flat = cls_nms.view(batch_size, -1)  # [B, C*H*W]
+        obj_per_pos = obj.view(batch_size, 1, -1).expand(
+            -1, self.num_classes, -1).reshape(batch_size, -1)  # replicated per class
+        cls_flat_fg = cls_flat
+        cls_topk_idx = cls_flat_fg.topk(num_cls_proposals, dim=-1).indices
+
+        cls_class = cls_topk_idx // num_spatial        # [B, num_cls_proposals]
+        cls_spatial = cls_topk_idx % num_spatial       # [B, num_cls_proposals]
+
+        # Top-K from unknown (spatially dilate known-query mask to suppress
+        # nearby duplicates, then mask out dilated region)
+        unknown_flat = unknown_nms.view(batch_size, -1)
+        cls_spatial_mask = torch.zeros(batch_size, num_spatial, device=unknown_flat.device, dtype=torch.bool)
+        cls_spatial_mask.scatter_(1, cls_spatial, True)
+
+        # Spatial dilation via maxpool to suppress unknown near known queries
+        H, W_hm = cls_nms.shape[-2], cls_nms.shape[-1]
+        cls_spatial_mask_2d = cls_spatial_mask.view(batch_size, 1, H, W_hm).float()
+        cls_spatial_mask_2d = F.max_pool2d(
+            cls_spatial_mask_2d, kernel_size=3, stride=1, padding=1)
+        cls_spatial_mask = cls_spatial_mask_2d.view(batch_size, -1) > 0.0
+
+        unknown_flat = unknown_flat.masked_fill(cls_spatial_mask, -1.0)
+        
+        unk_topk_idx = unknown_flat.topk(
+            self.num_unknown_proposals, dim=-1).indices
+        unk_spatial = unk_topk_idx % num_spatial       # [B, num_unknown_proposals]
+
+        top_proposals_class = torch.cat([
+            cls_class,
+            cls_class.new_full((batch_size, self.num_unknown_proposals),
+                               self.num_classes),
+        ], dim=1)
+        top_proposals_index = torch.cat([cls_spatial, unk_spatial], dim=1)
+
+        assert top_proposals_index.max().item() < num_spatial, \
+            f'index {top_proposals_index.max().item()} >= {num_spatial}'
+        assert top_proposals_index.min().item() >= 0
+
+        # Flatten raw tensors for ret_dicts gathering
+        cls_score_flat = cls_score.view(batch_size, self.num_classes, -1)
+        obj_flat = obj.view(batch_size, 1, -1)
+        uncertainty_flat = uncertainty.view(batch_size, 1, -1)
+
         query_feat = fusion_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
                 -1, fusion_feat_flatten.shape[1], -1),
             dim=-1,
         )
-        self.query_labels = top_proposals_class
+        # stored in ret_dicts (not on module) to avoid DDP sync issues
 
         # add category embedding
+        # unknown-origin queries (class=num_classes): zero one_hot = no class prior
+        clamped_class = top_proposals_class.clamp(max=self.num_classes - 1)
         one_hot = F.one_hot(
-            top_proposals_class,
+            clamped_class,
             num_classes=self.num_classes).permute(0, 2, 1)
+        unknown_origin = (top_proposals_class == self.num_classes)
+        one_hot = one_hot * (~unknown_origin[:, None, :])
         query_cat_encoding = self.class_encoding(one_hot.float())
+        if unknown_origin.any():
+            obj_token = self.objectness_token.view(1, -1, 1).expand(
+                batch_size, -1, self.num_proposals)
+            query_cat_encoding = query_cat_encoding + obj_token * unknown_origin[:,
+                                                                                  None, :].float()
         query_feat += query_cat_encoding
 
         query_pos = bev_pos.gather(
@@ -439,18 +549,23 @@ class TransFusionHead(nn.Module):
             # for next level positional embedding
             query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
 
-        ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
+        ret_dicts[0]['query_heatmap_score'] = cls_score_flat.gather(
             index=top_proposals_index[:,
                                       None, :].expand(-1, self.num_classes,
                                                       -1),
             dim=-1,
-        )  # [bs, num_classes, num_proposals]
-        ret_dicts[0]['query_objectness_score'] = objectness.gather(
+        )
+        ret_dicts[0]['query_objectness_score'] = obj_flat.gather(
             index=top_proposals_index[:, None, :].expand(-1, 1, -1),
             dim=-1,
-        ) # [bs, 1, num_proposals]
+        )
+        ret_dicts[0]['query_uncertainty_score'] = uncertainty_flat.gather(
+            index=top_proposals_index[:, None, :].expand(-1, 1, -1),
+            dim=-1,
+        )
         ret_dicts[0]['dense_heatmap'] = dense_heatmap
-        ret_dicts[0]['dense_objectness'] = dense_objectness # [NEW]
+        ret_dicts[0]['dense_objectness'] = dense_objectness
+        ret_dicts[0]['query_labels'] = top_proposals_class
 
         if self.auxiliary is False:
             # only return the results of last decoder layer
@@ -461,7 +576,8 @@ class TransFusionHead(nn.Module):
         for key in ret_dicts[0].keys():
             if key not in [
                     'dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score',
-                    'dense_objectness', 'query_objectness_score'
+                    'dense_objectness', 'query_objectness_score',
+                    'query_uncertainty_score', 'query_labels',
             ]:
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1)
@@ -512,13 +628,17 @@ class TransFusionHead(nn.Module):
             batch_obj = preds_dict[0]['objectness'][
                 ..., -self.num_proposals:].sigmoid() # [NEW]
 
-            one_hot = F.one_hot(
-                self.query_labels,
-                num_classes=self.num_classes).permute(0, 2, 1)
-            batch_score = batch_score * preds_dict[0][
-                'query_heatmap_score'] * one_hot
+            query_labels = preds_dict[0]['query_labels']
+            obj_query_mask = (query_labels == self.num_classes)
+            # Soft prior from initial dense heatmap for known queries; 1.0 for unknown queries
+            query_score_prior = preds_dict[0]['query_heatmap_score'] * (~obj_query_mask[:, None, :]).float() + obj_query_mask[:, None, :].float()
             
-            batch_obj = batch_obj * preds_dict[0]['query_objectness_score'] # [NEW]
+            # Weighted average: decoder can correct dense prior errors (class migration)
+            alpha = float(self.test_cfg.get('query_prior_alpha', 0.2))
+            batch_score = (1.0 - alpha) * batch_score + alpha * query_score_prior
+            
+            if self.objectness_use_query_seed_score:
+                batch_obj = batch_obj * preds_dict[0]['query_objectness_score']
 
             batch_center = preds_dict[0]['center'][..., -self.num_proposals:]
             batch_height = preds_dict[0]['height'][..., -self.num_proposals:]
@@ -538,21 +658,72 @@ class TransFusionHead(nn.Module):
                 filter=False,
             )
 
-            # [NEW] Open-World Reasoning Logic (configurable for dual-track eval)
-            open_world_mode = self.test_cfg.get('open_world_mode', 'open_world')
+            # Open-World Reasoning: source-aware dual-threshold unknown assignment.
+            #
+            #  Unknown-origin queries (25) → loose thresholds (exploration).
+            #  Known-origin queries (175) → strict thresholds (protection).
+            #
+            #  Additionally, confident known queries are protected from being
+            #  relabeled even if they pass the known-origin thresholds.
+            open_world_mode = self.test_cfg.get('open_world_mode', 'known_only')
             enable_unknown = open_world_mode != 'known_only'
-            obj_thresh = float(self.test_cfg.get('unknown_obj_thresh', 0.5))
-            cls_thresh = float(self.test_cfg.get('unknown_cls_thresh', 0.3))
             unknown_label_id = int(
                 self.test_cfg.get('unknown_label_id', self.num_classes))
+
+            # --- unknown-origin thresholds (loose) ---
+            unk_obj_thresh = float(
+                self.test_cfg.get('unknown_obj_thresh', 0.20))
+            unk_unc_thresh = float(
+                self.test_cfg.get('unknown_uncertainty_thresh', 0.45))
+            unk_phys_thresh = float(
+                self.test_cfg.get('unknown_physical_thresh', 0.10))
+
+            # --- known-origin thresholds (strict) ---
+            known_obj_thresh = float(
+                self.test_cfg.get('known_origin_obj_thresh', 0.20))
+            known_unc_thresh = float(
+                self.test_cfg.get('known_origin_unc_thresh', 0.60))
+            known_phys_thresh = float(
+                self.test_cfg.get('known_origin_phys_thresh', 0.18))
+
+            # --- protection zone: confident known queries are never stolen ---
+            protect_cls_thresh = float(
+                self.test_cfg.get('known_protect_cls_thresh', 0.60))
+            protect_unc_thresh = float(
+                self.test_cfg.get('known_protect_unc_thresh', 0.40))
+
             for i in range(batch_size):
-                obj_scores_i = batch_obj[i, 0]  # shape: [num_proposals]
-                max_semantic_scores_i = batch_score[i].max(dim=0).values
+                obj_scores_i = batch_obj[i, 0]
                 if enable_unknown:
-                    # Identify unknown objects
-                    is_unknown = ((obj_scores_i > obj_thresh)
-                                  & (max_semantic_scores_i < cls_thresh))
-                    # Update labels and scores before filtering so mask shapes match.
+                    is_unknown_origin = obj_query_mask[i]
+                    query_unc_scores = preds_dict[0][
+                        'query_uncertainty_score'][i, 0]
+                    query_physical = preds_dict[0][
+                        'query_objectness_score'][i, 0]
+
+                    # unknown-origin: loose exploration
+                    unk_candidate = (
+                        is_unknown_origin
+                        & (obj_scores_i > unk_obj_thresh)
+                        & (query_unc_scores > unk_unc_thresh)
+                        & (query_physical > unk_phys_thresh))
+
+                    # known-origin: only when classifier is clearly confused
+                    known_candidate = (
+                        (~is_unknown_origin)
+                        & (obj_scores_i > known_obj_thresh)
+                        & (query_unc_scores > known_unc_thresh)
+                        & (query_physical > known_phys_thresh))
+
+                    # protection: confident known → never steal
+                    cls_conf = batch_score[i].max(dim=0).values
+                    protected = (
+                        (~is_unknown_origin)
+                        & (cls_conf > protect_cls_thresh)
+                        & (query_unc_scores < protect_unc_thresh))
+                    known_candidate = known_candidate & (~protected)
+
+                    is_unknown = unk_candidate | known_candidate
                     temp[i]['labels'][is_unknown] = unknown_label_id
                     temp[i]['scores'][is_unknown] = obj_scores_i[is_unknown]
 
@@ -669,8 +840,12 @@ class TransFusionHead(nn.Module):
                                     test_cfg['post_maxsize'],
                                 )
                         else:
-                            task_keep_indices = torch.arange(task_mask.sum())
+                            task_keep_indices = torch.arange(
+                                int(task_mask.sum().item()),
+                                device=scores.device)
                         if task_keep_indices.shape[0] != 0:
+                            task_keep_indices = task_keep_indices.to(
+                                scores.device)
                             keep_indices = torch.where(
                                 task_mask != 0)[0][task_keep_indices]
                             keep_mask[keep_indices] = 1
@@ -684,7 +859,7 @@ class TransFusionHead(nn.Module):
                     ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
 
                 temp_instances = InstanceData()
-                temp_instances.bboxes_3d = metas[0]['box_type_3d'](
+                temp_instances.bboxes_3d = metas[i]['box_type_3d'](
                     ret['bboxes'], box_dim=ret['bboxes'].shape[-1])
                 temp_instances.scores_3d = ret['scores']
                 temp_instances.labels_3d = ret['labels'].int()
@@ -835,7 +1010,7 @@ class TransFusionHead(nn.Module):
                     gt_bboxes_tensor,
                     None,
                     gt_labels_3d,
-                    self.query_labels[batch_idx],
+                    preds_dict['query_labels'][0],
                 )
             else:
                 raise NotImplementedError
@@ -1004,15 +1179,18 @@ class TransFusionHead(nn.Module):
             heatmap.float(),
             avg_factor=max(heatmap.eq(1).float().sum().item(), 1),
         )
-        loss_objectness = self.loss_heatmap(
-            clip_sigmoid(preds_dict['dense_objectness']).float(),
-            objectness_heatmap.float(),
-            avg_factor=max(objectness_heatmap.eq(1).float().sum().item(), 1),
-        ) # [NEW]
         loss_dict['loss_heatmap'] = loss_heatmap
-        loss_dict['loss_objectness'] = loss_objectness # [NEW]
+        loss_objectness_dense = None
+        if self.objectness_dense_supervision and self.objectness_dense_loss_weight > 0:
+            loss_objectness_dense = self.loss_heatmap(
+                clip_sigmoid(preds_dict['dense_objectness']).float(),
+                objectness_heatmap.float(),
+                avg_factor=max(objectness_heatmap.eq(1).float().sum().item(), 1),
+            ) * self.objectness_dense_loss_weight
+            loss_dict['loss_objectness_dense'] = loss_objectness_dense
 
         # compute loss for each layer
+        last_layer_loss_obj = None
         for idx_layer in range(
                 self.num_decoder_layers if self.auxiliary else 1):
             if idx_layer == self.num_decoder_layers - 1 or (
@@ -1047,13 +1225,38 @@ class TransFusionHead(nn.Module):
                                                                            1) *
                                                        self.num_proposals, ]
             layer_obj_score = layer_obj_score.permute(0, 2, 1).reshape(-1)
-            layer_obj_targets = (layer_labels < self.num_classes).float()
+            
+            layer_bbox_weights_raw = bbox_weights[..., idx_layer *
+                                                  self.num_proposals:(idx_layer + 1) *
+                                                  self.num_proposals, :]
+            # -- objectness target: only GT-matched queries are positive (1.0) --
+            # Unmatched queries in regions with high physical prior are
+            # potential unknown foreground — mask them out (weight=0) so they
+            # are NOT trained as background.
+            is_matched = (layer_bbox_weights_raw.max(-1).values > 0).float().reshape(-1)
+            layer_obj_targets = is_matched.clone()
+
+            query_physical = preds_dict['query_objectness_score'].detach()  # [B, 1, N]
+            query_physical_flat = query_physical.permute(0, 2, 1).reshape(-1)
+            physical_ignore_thresh = float(
+                self.train_cfg.get('physical_ignore_thresh', 0.15))
+            unknown_candidate = (~is_matched.bool()) & (
+                query_physical_flat > physical_ignore_thresh)
+
+            obj_weights = layer_label_weights.float().clone()
+            # Soft pseudo-labeling for high-physical-prior regions without GT match
+            layer_obj_targets[unknown_candidate] = query_physical_flat[unknown_candidate].clamp(min=0.0, max=1.0)
+            obj_weights[unknown_candidate] = 0.2  # Weak positive supervision
+            obj_denom = max(obj_weights.sum().item(), 1.0)
+            obj_pos_weight = layer_obj_score.new_tensor(
+                self.objectness_bce_pos_weight)
             layer_loss_obj = F.binary_cross_entropy_with_logits(
                 layer_obj_score.float(),
                 layer_obj_targets,
-                weight=layer_label_weights.float(),
-                reduction='sum'
-            ) / max(num_pos, 1)
+                weight=obj_weights,
+                pos_weight=obj_pos_weight,
+                reduction='sum') / obj_denom
+            layer_loss_obj = layer_loss_obj * self.objectness_query_loss_weight
 
             layer_center = preds_dict['center'][..., idx_layer *
                                                 self.num_proposals:(idx_layer +
@@ -1104,6 +1307,20 @@ class TransFusionHead(nn.Module):
             loss_dict[f'{prefix}_loss_obj'] = layer_loss_obj # [NEW]
             loss_dict[f'{prefix}_loss_bbox'] = layer_loss_bbox
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
+            if prefix == 'layer_-1':
+                last_layer_loss_obj = layer_loss_obj
+
+        objectness_log_total = None
+        if last_layer_loss_obj is not None:
+            loss_dict['objectness_query_final'] = last_layer_loss_obj.detach()
+            objectness_log_total = last_layer_loss_obj.detach()
+        if loss_objectness_dense is not None:
+            dense_log = loss_objectness_dense.detach()
+            objectness_log_total = (
+                dense_log if objectness_log_total is None else
+                objectness_log_total + dense_log)
+        if objectness_log_total is not None:
+            loss_dict['objectness_total'] = objectness_log_total
 
         loss_dict['matched_ious'] = layer_loss_cls.new_tensor(matched_ious)
         loss_dict['matched_iou_max'] = layer_loss_cls.new_tensor(
@@ -1121,6 +1338,10 @@ class TransFusionHead(nn.Module):
             query_obj = preds_dict['query_objectness_score'].detach()
             loss_dict['dbg_query_obj_mean'] = query_obj.mean()
             loss_dict['dbg_query_obj_max'] = query_obj.max()
+        if 'query_uncertainty_score' in preds_dict:
+            query_unc = preds_dict['query_uncertainty_score'].detach()
+            loss_dict['dbg_query_unc_mean'] = query_unc.mean()
+            loss_dict['dbg_query_unc_max'] = query_unc.max()
         if getattr(self, 'latest_geo_mask_stats', None) is not None:
             stats = self.latest_geo_mask_stats
             if 'ratio' in stats:

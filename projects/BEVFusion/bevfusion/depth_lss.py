@@ -3,6 +3,7 @@ from typing import Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from mmdet3d.registry import MODELS
 from .ops import bev_pool
@@ -345,6 +346,9 @@ class DepthLSSTransform(BaseDepthTransform):
         zbound: Tuple[float, float, float],
         dbound: Tuple[float, float, float],
         downsample: int = 1,
+        use_depth_valid_mask: bool = True,
+        depth_valid_mask_weight: float = 0.3,
+        depth_dilate_kernel: int = 3,
     ) -> None:
         """Compared with `LSSTransform`, `DepthLSSTransform` adds sparse depth
         information from lidar points into the inputs of the `depthnet`."""
@@ -358,6 +362,11 @@ class DepthLSSTransform(BaseDepthTransform):
             zbound=zbound,
             dbound=dbound,
         )
+        self.use_depth_valid_mask = bool(use_depth_valid_mask)
+        self.depth_valid_mask_weight = float(depth_valid_mask_weight)
+        self.depth_dilate_kernel = int(depth_dilate_kernel)
+        if self.depth_dilate_kernel < 1 or self.depth_dilate_kernel % 2 == 0:
+            raise ValueError('depth_dilate_kernel must be a positive odd integer.')
         self.dtransform = nn.Sequential(
             nn.Conv2d(1, 8, 1),
             nn.BatchNorm2d(8),
@@ -369,6 +378,20 @@ class DepthLSSTransform(BaseDepthTransform):
             nn.BatchNorm2d(64),
             nn.ReLU(True),
         )
+        if self.use_depth_valid_mask:
+            self.mask_transform = nn.Sequential(
+                nn.Conv2d(1, 8, 1),
+                nn.BatchNorm2d(8),
+                nn.ReLU(True),
+                nn.Conv2d(8, 32, 5, stride=4, padding=2),
+                nn.BatchNorm2d(32),
+                nn.ReLU(True),
+                nn.Conv2d(32, 64, 5, stride=2, padding=2),
+                nn.BatchNorm2d(64),
+                nn.ReLU(True),
+            )
+        else:
+            self.mask_transform = None
         self.depthnet = nn.Sequential(
             nn.Conv2d(in_channels + 64, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
@@ -403,13 +426,40 @@ class DepthLSSTransform(BaseDepthTransform):
         else:
             self.downsample = nn.Identity()
 
+    def _densify_depth_map(self, depth: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid_mask = (depth > 0).to(depth.dtype)
+        if self.depth_dilate_kernel <= 1:
+            return depth, valid_mask
+
+        pad = self.depth_dilate_kernel // 2
+        local_count = F.avg_pool2d(
+            valid_mask,
+            kernel_size=self.depth_dilate_kernel,
+            stride=1,
+            padding=pad) * (self.depth_dilate_kernel**2)
+        local_sum = F.avg_pool2d(
+            depth * valid_mask,
+            kernel_size=self.depth_dilate_kernel,
+            stride=1,
+            padding=pad) * (self.depth_dilate_kernel**2)
+        local_mean = local_sum / local_count.clamp_min(1.0)
+        fillable = (valid_mask == 0) & (local_count > 0)
+        depth = torch.where(fillable, local_mean, depth)
+        valid_mask = torch.where(fillable, torch.ones_like(valid_mask),
+                                 valid_mask)
+        return depth, valid_mask
+
     def get_cam_feats(self, x, d):
         B, N, C, fH, fW = x.shape
 
         d = d.view(B * N, *d.shape[2:])
         x = x.view(B * N, C, fH, fW)
 
+        d, valid_mask = self._densify_depth_map(d)
         d = self.dtransform(d)
+        if self.mask_transform is not None:
+            d = d + self.depth_valid_mask_weight * self.mask_transform(
+                valid_mask)
         x = torch.cat([d, x], dim=1)
         x = self.depthnet(x)
 

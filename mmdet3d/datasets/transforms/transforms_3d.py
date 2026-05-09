@@ -1002,6 +1002,58 @@ class ObjectNameFilter(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class OpenWorldClassHoldout(BaseTransform):
+    """Remove selected class labels from training annotations.
+
+    Unlike :class:`ObjectNameFilter`, this transform keeps the original label
+    ids and filters by names in the full dataset class list. It is intended for
+    open-world class-holdout experiments where the held-out objects should stay
+    in the point cloud/image inputs but no longer provide known-class GT boxes.
+
+    Required Keys:
+
+    - gt_labels_3d
+
+    Modified Keys:
+
+    - gt_bboxes_3d
+    - gt_labels_3d
+
+    Args:
+        classes (list[str]): Full class list in the original label order.
+        holdout_classes (list[str]): Class names to remove from GT labels.
+    """
+
+    def __init__(self, classes: List[str],
+                 holdout_classes: List[str]) -> None:
+        unknown = sorted(set(holdout_classes).difference(classes))
+        if unknown:
+            raise ValueError(
+                f'holdout_classes contains unknown classes: {unknown}')
+        self.classes = classes
+        self.holdout_classes = holdout_classes
+        self.holdout_labels = {
+            classes.index(class_name)
+            for class_name in holdout_classes
+        }
+
+    def transform(self, input_dict: dict) -> dict:
+        gt_labels_3d = input_dict['gt_labels_3d']
+        gt_bboxes_mask = np.array(
+            [int(label) not in self.holdout_labels for label in gt_labels_3d],
+            dtype=bool)
+        input_dict['gt_bboxes_3d'] = input_dict['gt_bboxes_3d'][gt_bboxes_mask]
+        input_dict['gt_labels_3d'] = input_dict['gt_labels_3d'][gt_bboxes_mask]
+
+        return input_dict
+
+    def __repr__(self) -> str:
+        repr_str = self.__class__.__name__
+        repr_str += f'(holdout_classes={self.holdout_classes})'
+        return repr_str
+
+
+@TRANSFORMS.register_module()
 class PointSample(BaseTransform):
     """Point sample.
 

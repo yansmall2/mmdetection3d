@@ -14,6 +14,8 @@ UNKNOWN_CLS_THRESH="${UNKNOWN_CLS_THRESH:-0.3}"
 UNKNOWN_LABEL_ID="${UNKNOWN_LABEL_ID:-10}"
 UNKNOWN_IOU_THR="${UNKNOWN_IOU_THR:-0.25}"
 UNKNOWN_SCORE_THR="${UNKNOWN_SCORE_THR:-0.1}"
+GPUS="${GPUS:-1}"
+EPOCHS="${EPOCHS:-5}"
 
 if [[ -z "$PRETRAIN" ]]; then
   echo "[ERROR] PRETRAIN is empty. Please set PRETRAIN=/abs/path/to/bevfusion_ckpt.pth"
@@ -40,19 +42,22 @@ COMMON_CFG_OPTS=(
   "test_evaluator.unknown_score_thr=${UNKNOWN_SCORE_THR}"
   "val_evaluator.unknown_label_id=${UNKNOWN_LABEL_ID}"
   "test_evaluator.unknown_label_id=${UNKNOWN_LABEL_ID}"
+  "train_cfg.max_epochs=${EPOCHS}"
 )
 
 CFG_B="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_nus-3d.py"
 CFG_BM_SOFT02="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_geomask_soft_lam02_nus-3d.py"
+CFG_BM_SOFT03="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_geomask_soft_lam03_nus-3d.py"
 CFG_BM_SOFT05="projects/BEVFusion/configs/bevfusion_lidar-cam_abmini_cross_geomask_soft_nus-3d.py"
 
 WD_B="$RUN_ROOT/B_baseline"
 WD_BM_SOFT02="$RUN_ROOT/BM_soft_lam02"
+WD_BM_SOFT03="$RUN_ROOT/BM_soft_lam03"
 WD_BM_SOFT05="$RUN_ROOT/BM_soft_lam05"
 
-exp_names=("B" "BM_soft_lam02" "BM_soft_lam05")
-exp_cfgs=("$CFG_B" "$CFG_BM_SOFT02" "$CFG_BM_SOFT05")
-exp_wds=("$WD_B" "$WD_BM_SOFT02" "$WD_BM_SOFT05")
+exp_names=("B" "BM_soft_lam02" "BM_soft_lam03" "BM_soft_lam05")
+exp_cfgs=("$CFG_B" "$CFG_BM_SOFT02" "$CFG_BM_SOFT03" "$CFG_BM_SOFT05")
+exp_wds=("$WD_B" "$WD_BM_SOFT02" "$WD_BM_SOFT03" "$WD_BM_SOFT05")
 
 find_checkpoint() {
   local work_dir="$1"
@@ -76,15 +81,27 @@ run_eval_mode() {
 
   mkdir -p "$eval_dir"
   mkdir -p "$export_dir"
-  python tools/test.py "$cfg" "$ckpt" \
-    --work-dir "$eval_dir" \
-    --cfg-options \
-      "${COMMON_CFG_OPTS[@]}" \
-      "model.bbox_head.test_cfg.open_world_mode=${mode}" \
-      "model.bbox_head.test_cfg.unknown_obj_thresh=${UNKNOWN_OBJ_THRESH}" \
-      "model.bbox_head.test_cfg.unknown_cls_thresh=${UNKNOWN_CLS_THRESH}" \
-      "model.bbox_head.test_cfg.unknown_label_id=${UNKNOWN_LABEL_ID}" \
-      "test_evaluator.jsonfile_prefix=${export_dir}"
+  if [[ "$GPUS" -eq 1 ]]; then
+    python tools/test.py "$cfg" "$ckpt" \
+      --work-dir "$eval_dir" \
+      --cfg-options \
+        "${COMMON_CFG_OPTS[@]}" \
+        "model.bbox_head.test_cfg.open_world_mode=${mode}" \
+        "model.bbox_head.test_cfg.unknown_obj_thresh=${UNKNOWN_OBJ_THRESH}" \
+        "model.bbox_head.test_cfg.unknown_cls_thresh=${UNKNOWN_CLS_THRESH}" \
+        "model.bbox_head.test_cfg.unknown_label_id=${UNKNOWN_LABEL_ID}" \
+        "test_evaluator.jsonfile_prefix=${export_dir}"
+  else
+    bash tools/dist_test.sh "$cfg" "$ckpt" "$GPUS" \
+      --work-dir "$eval_dir" \
+      --cfg-options \
+        "${COMMON_CFG_OPTS[@]}" \
+        "model.bbox_head.test_cfg.open_world_mode=${mode}" \
+        "model.bbox_head.test_cfg.unknown_obj_thresh=${UNKNOWN_OBJ_THRESH}" \
+        "model.bbox_head.test_cfg.unknown_cls_thresh=${UNKNOWN_CLS_THRESH}" \
+        "model.bbox_head.test_cfg.unknown_label_id=${UNKNOWN_LABEL_ID}" \
+        "test_evaluator.jsonfile_prefix=${export_dir}"
+  fi
 }
 
 for i in "${!exp_names[@]}"; do
@@ -98,8 +115,14 @@ for i in "${!exp_names[@]}"; do
   open_status="skipped"
 
   t0="$(date +%s)"
-  if ! python tools/train.py "$cfg" --work-dir "$wd" --cfg-options "${COMMON_CFG_OPTS[@]}"; then
-    train_status="failed"
+  if [[ "$GPUS" -eq 1 ]]; then
+    if ! python tools/train.py "$cfg" --work-dir "$wd" --cfg-options "${COMMON_CFG_OPTS[@]}"; then
+      train_status="failed"
+    fi
+  else
+    if ! bash tools/dist_train.sh "$cfg" "$GPUS" --work-dir "$wd" --cfg-options "${COMMON_CFG_OPTS[@]}"; then
+      train_status="failed"
+    fi
   fi
   t1="$(date +%s)"
   train_sec=$((t1 - t0))
@@ -141,16 +164,16 @@ for i in "${!exp_names[@]}"; do
   echo -e "${name}\t${cfg}\t${wd}\t${ckpt}\t${train_status}\t${train_sec}\t${known_status}\t${known_sec}\t${open_status}\t${open_sec}" >> "$MANIFEST"
 done
 
-if [[ -d "$WD_B" && -d "$WD_BM_SOFT02" && -d "$WD_BM_SOFT05" ]]; then
+if [[ -d "$WD_B" && -d "$WD_BM_SOFT02" && -d "$WD_BM_SOFT03" && -d "$WD_BM_SOFT05" ]]; then
   HAVE_A="$(find "$WD_B" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
   HAVE_B="$(find "$WD_BM_SOFT02" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
-  HAVE_C="$(find "$WD_BM_SOFT05" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
+  HAVE_C="$(find "$WD_BM_SOFT03" -type f -path "*/vis_data/*.json" | head -n 1 || true)"
   if [[ -n "$HAVE_A" && -n "$HAVE_B" && -n "$HAVE_C" ]]; then
-    echo "[RUN] Compare first/last windows for B vs BM-soft(0.2/0.5)"
+    echo "[RUN] Compare first/last windows for B vs BM-soft(0.2/0.3)"
     python tools/analysis_tools/compare_ab_matched_ious.py \
       --exp-a "$WD_B" \
       --exp-b "$WD_BM_SOFT02" \
-      --exp-c "$WD_BM_SOFT05" \
+      --exp-c "$WD_BM_SOFT03" \
       --max-iter 500 | tee "$RUN_ROOT/compare_train_windows.txt"
   else
     echo "[WARN] Skip compare_ab_matched_ious.py because vis_data json is missing in one or more runs"

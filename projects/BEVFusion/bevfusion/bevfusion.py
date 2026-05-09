@@ -250,7 +250,7 @@ class BEVFusion(Base3DDetector):
             imgs = imgs.contiguous()
             lidar2image, camera_intrinsics, camera2lidar = [], [], []
             img_aug_matrix, lidar_aug_matrix = [], []
-            for i, meta in enumerate(batch_input_metas):
+            for meta in batch_input_metas:
                 lidar2image.append(meta['lidar2img'])
                 camera_intrinsics.append(meta['cam2img'])
                 camera2lidar.append(meta['cam2lidar'])
@@ -269,14 +269,19 @@ class BEVFusion(Base3DDetector):
                                                 lidar_aug_matrix,
                                                 batch_input_metas)
             features.append(img_feature)
+
         pts_feature = self.extract_pts_feat(batch_inputs_dict)
         features.append(pts_feature)
 
         if self.fusion_layer is not None:
             x = self.fusion_layer(features)
+            if hasattr(self.fusion_layer, 'latest_geo_mask_stats'):
+                self.bbox_head.latest_geo_mask_stats = (
+                    self.fusion_layer.latest_geo_mask_stats)
         else:
             assert len(features) == 1, features
             x = features[0]
+            self.bbox_head.latest_geo_mask_stats = None
 
         x = self.pts_backbone(x)
         x = self.pts_neck(x)
