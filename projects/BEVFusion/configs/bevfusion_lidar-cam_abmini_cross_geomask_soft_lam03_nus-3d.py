@@ -25,19 +25,8 @@ model = dict(
         num_unknown_proposals=25,
 
         test_cfg=dict(
-            open_world_mode='open_world',
-            # unknown-origin: loose exploration
-            unknown_obj_thresh=0.15,
-            unknown_uncertainty_thresh=0.40,
-            unknown_physical_thresh=0.05,
-            # known-origin: only when classifier is clearly confused
-            known_origin_obj_thresh=0.20,
-            known_origin_unc_thresh=0.55,
-            known_origin_phys_thresh=0.18,
-            # protection: confident known queries never stolen
-            known_protect_cls_thresh=0.50,
-            known_protect_unc_thresh=0.35,
-            # misc
+            open_world_mode='dual_track',
+            unknown_obj_thresh=0.20,
             unknown_cls_thresh=0.30,
             unknown_label_id=10,
         )

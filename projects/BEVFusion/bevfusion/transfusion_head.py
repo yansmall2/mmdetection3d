@@ -414,11 +414,9 @@ class TransFusionHead(nn.Module):
         # 3) Objectness (detached — gradient only through its own loss)
         obj = dense_objectness.detach().sigmoid()            # [B, 1, H, W]
 
-        # 4) Unknown heatmap = uncertainty × sqrt(physical_prior) × (1 - max_cls)
-        #    physical_prior (= dense_objectness) biases toward foreground regions,
-        #    preventing empty-space regions from being selected as unknown proposals.
-        #    sqrt softens the physical prior to avoid dominance early in training.
-        unknown_heatmap = uncertainty * torch.sqrt(obj) * (1.0 - cls_score.max(dim=1, keepdim=True)[0])
+        # 4) Unknown heatmap = uncertainty × sqrt(physical_prior).
+        #    uncertainty already = (1 - max_cls), no need to multiply again.
+        unknown_heatmap = uncertainty * torch.sqrt(obj)
 
         # --- Per-class NMS for known query selection ---
         padding = self.nms_kernel_size // 2
@@ -458,7 +456,7 @@ class TransFusionHead(nn.Module):
         cls_flat = cls_nms.view(batch_size, -1)  # [B, C*H*W]
         obj_per_pos = obj.view(batch_size, 1, -1).expand(
             -1, self.num_classes, -1).reshape(batch_size, -1)  # replicated per class
-        cls_flat_fg = cls_flat
+        cls_flat_fg = cls_flat * torch.sqrt(obj_per_pos)
         cls_topk_idx = cls_flat_fg.topk(num_cls_proposals, dim=-1).indices
 
         cls_class = cls_topk_idx // num_spatial        # [B, num_cls_proposals]
@@ -658,72 +656,24 @@ class TransFusionHead(nn.Module):
                 filter=False,
             )
 
-            # Open-World Reasoning: source-aware dual-threshold unknown assignment.
-            #
-            #  Unknown-origin queries (25) → loose thresholds (exploration).
-            #  Known-origin queries (175) → strict thresholds (protection).
-            #
-            #  Additionally, confident known queries are protected from being
-            #  relabeled even if they pass the known-origin thresholds.
+            # Open-World Reasoning: simple dual-track assignment.
+            # Any query with high objectness AND low max classification score
+            # is treated as unknown. All queries share the same thresholds.
             open_world_mode = self.test_cfg.get('open_world_mode', 'known_only')
             enable_unknown = open_world_mode != 'known_only'
             unknown_label_id = int(
                 self.test_cfg.get('unknown_label_id', self.num_classes))
-
-            # --- unknown-origin thresholds (loose) ---
-            unk_obj_thresh = float(
+            obj_thresh = float(
                 self.test_cfg.get('unknown_obj_thresh', 0.20))
-            unk_unc_thresh = float(
-                self.test_cfg.get('unknown_uncertainty_thresh', 0.45))
-            unk_phys_thresh = float(
-                self.test_cfg.get('unknown_physical_thresh', 0.10))
-
-            # --- known-origin thresholds (strict) ---
-            known_obj_thresh = float(
-                self.test_cfg.get('known_origin_obj_thresh', 0.20))
-            known_unc_thresh = float(
-                self.test_cfg.get('known_origin_unc_thresh', 0.60))
-            known_phys_thresh = float(
-                self.test_cfg.get('known_origin_phys_thresh', 0.18))
-
-            # --- protection zone: confident known queries are never stolen ---
-            protect_cls_thresh = float(
-                self.test_cfg.get('known_protect_cls_thresh', 0.60))
-            protect_unc_thresh = float(
-                self.test_cfg.get('known_protect_unc_thresh', 0.40))
+            cls_thresh = float(
+                self.test_cfg.get('unknown_cls_thresh', 0.30))
 
             for i in range(batch_size):
                 obj_scores_i = batch_obj[i, 0]
                 if enable_unknown:
-                    is_unknown_origin = obj_query_mask[i]
-                    query_unc_scores = preds_dict[0][
-                        'query_uncertainty_score'][i, 0]
-                    query_physical = preds_dict[0][
-                        'query_objectness_score'][i, 0]
-
-                    # unknown-origin: loose exploration
-                    unk_candidate = (
-                        is_unknown_origin
-                        & (obj_scores_i > unk_obj_thresh)
-                        & (query_unc_scores > unk_unc_thresh)
-                        & (query_physical > unk_phys_thresh))
-
-                    # known-origin: only when classifier is clearly confused
-                    known_candidate = (
-                        (~is_unknown_origin)
-                        & (obj_scores_i > known_obj_thresh)
-                        & (query_unc_scores > known_unc_thresh)
-                        & (query_physical > known_phys_thresh))
-
-                    # protection: confident known → never steal
-                    cls_conf = batch_score[i].max(dim=0).values
-                    protected = (
-                        (~is_unknown_origin)
-                        & (cls_conf > protect_cls_thresh)
-                        & (query_unc_scores < protect_unc_thresh))
-                    known_candidate = known_candidate & (~protected)
-
-                    is_unknown = unk_candidate | known_candidate
+                    max_cls_scores_i = batch_score[i].max(dim=0).values
+                    is_unknown = ((obj_scores_i > obj_thresh)
+                                  & (max_cls_scores_i < cls_thresh))
                     temp[i]['labels'][is_unknown] = unknown_label_id
                     temp[i]['scores'][is_unknown] = obj_scores_i[is_unknown]
 
@@ -1246,7 +1196,7 @@ class TransFusionHead(nn.Module):
             obj_weights = layer_label_weights.float().clone()
             # Soft pseudo-labeling for high-physical-prior regions without GT match
             layer_obj_targets[unknown_candidate] = query_physical_flat[unknown_candidate].clamp(min=0.0, max=1.0)
-            obj_weights[unknown_candidate] = 0.2  # Weak positive supervision
+            obj_weights[unknown_candidate] = 0.05  # Weak positive supervision, conservative early-stage
             obj_denom = max(obj_weights.sum().item(), 1.0)
             obj_pos_weight = layer_obj_score.new_tensor(
                 self.objectness_bce_pos_weight)
